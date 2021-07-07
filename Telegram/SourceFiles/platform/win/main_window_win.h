@@ -1,28 +1,18 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
 #include "platform/platform_main_window.h"
+#include "ui/platform/win/ui_window_shadow_win.h"
+#include "base/platform/win/base_windows_h.h"
 #include "base/flags.h"
-#include <windows.h>
+
+#include <QtCore/QTimer>
 
 namespace Ui {
 class PopupMenu;
@@ -31,45 +21,34 @@ class PopupMenu;
 namespace Platform {
 
 class MainWindow : public Window::MainWindow {
-	Q_OBJECT
-
 public:
-	MainWindow();
+	explicit MainWindow(not_null<Window::Controller*> controller);
+
+	void showFromTrayMenu() override;
 
 	HWND psHwnd() const;
 	HMENU psMenu() const;
 
-	void psFirstShow();
 	void psInitSysMenu();
 	void updateSystemMenu(Qt::WindowState state);
-	void psUpdateMargins();
+	void updateCustomMargins();
+
+	void updateWindowIcon() override;
+	bool isActiveForTrayMenu() override;
 
 	void psRefreshTaskbarIcon();
 
 	virtual QImage iconWithCounter(int size, int count, style::color bg, style::color fg, bool smallIcon) = 0;
 
-	static UINT TaskbarCreatedMsgId() {
-		return _taskbarCreatedMsgId;
-	}
+	[[nodiscard]] static uint32 TaskbarCreatedMsgId();
 	static void TaskbarCreated();
 
 	// Custom shadows.
-	enum class ShadowsChange {
-		Moved    = (1 << 0),
-		Resized  = (1 << 1),
-		Shown    = (1 << 2),
-		Hidden   = (1 << 3),
-		Activate = (1 << 4),
-	};
-	using ShadowsChanges = base::flags<ShadowsChange>;
-	friend inline constexpr auto is_flag_type(ShadowsChange) { return true; };
-
-	bool shadowsWorking() const {
-		return _shadowsWorking;
-	}
 	void shadowsActivate();
 	void shadowsDeactivate();
-	void shadowsUpdate(ShadowsChanges changes, WINDOWPOS *position = nullptr);
+	void shadowsUpdate(
+		Ui::Platform::WindowShadow::Changes changes,
+		WINDOWPOS *position = nullptr);
 
 	int deltaLeft() const {
 		return _deltaLeft;
@@ -78,16 +57,19 @@ public:
 		return _deltaTop;
 	}
 
-	~MainWindow();
+	[[nodiscard]] bool hasTabletView() const;
 
-public slots:
 	void psShowTrayMenu();
+
+	~MainWindow();
 
 protected:
 	void initHook() override;
 	int32 screenNameChecksum(const QString &name) const override;
 	void unreadCounterChangedHook() override;
 
+	void initShadows() override;
+	void firstShadowsUpdate() override;
 	void stateChangedHook(Qt::WindowState state) override;
 
 	bool hasTrayIcon() const override {
@@ -103,19 +85,36 @@ protected:
 
 	void showTrayTooltip() override;
 
-	void workmodeUpdated(DBIWorkMode mode) override;
+	void workmodeUpdated(Core::Settings::WorkMode mode) override;
+
+	bool initSizeFromSystem() override;
+
+	QRect computeDesktopRect() const override;
 
 	QTimer psUpdatedPositionTimer;
 
 private:
+	struct Private;
+
+	void setupNativeWindowFrame();
 	void updateIconCounters();
-
+	QMargins computeCustomMargins();
+	void validateWindowTheme(bool native, bool night);
 	void psDestroyIcons();
+	void fixMaximizedWindow();
 
-	static UINT _taskbarCreatedMsgId;
+	const std::unique_ptr<Private> _private;
 
-	bool _shadowsWorking = false;
+	std::optional<Ui::Platform::WindowShadow> _shadow;
+
 	bool _themeInited = false;
+	bool _inUpdateMargins = false;
+	bool _wasNativeFrame = false;
+	bool _hasActiveFrame = false;
+
+	// Workarounds for activation from tray icon.
+	crl::time _lastDeactivateTime = 0;
+	rpl::lifetime _showFromTrayLifetime;
 
 	HWND ps_hWnd = nullptr;
 	HWND ps_tbHider_hWnd = nullptr;
@@ -126,6 +125,8 @@ private:
 
 	int _deltaLeft = 0;
 	int _deltaTop = 0;
+	int _deltaRight = 0;
+	int _deltaBottom = 0;
 
 };
 

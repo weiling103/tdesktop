@@ -1,24 +1,14 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
+
+#include "ui/rp_widget.h"
+#include "base/object_ptr.h"
 
 class AudioMsgId;
 
@@ -31,21 +21,28 @@ class FilledSlider;
 } // namespace Ui
 
 namespace Media {
-namespace Clip {
-class Playback;
+namespace View {
+class PlaybackProgress;
 } // namespace Clip
+} // namespace Media
 
+namespace Main {
+class Session;
+} // namespace Main
+
+namespace Media {
 namespace Player {
 
 class PlayButton;
 class VolumeWidget;
 struct TrackState;
 
-class Widget : public TWidget, private base::Subscriber {
+class Widget : public Ui::RpWidget, private base::Subscriber {
 public:
-	Widget(QWidget *parent);
+	Widget(QWidget *parent, not_null<Main::Session*> session);
 
-	void setCloseCallback(base::lambda<void()> callback);
+	void setCloseCallback(Fn<void()> callback);
+	void setShowItemCallback(Fn<void(not_null<const HistoryItem*>)> callback);
 	void stopAndClose();
 	void setShadowGeometryToLeft(int x, int y, int w, int h);
 	void showShadow();
@@ -77,9 +74,11 @@ private:
 	void updatePlayPrevNextPositions();
 	void updateLabelsGeometry();
 	void updateRepeatTrackIcon();
+	void updatePlaybackSpeedIcon();
 	void createPrevNextButtons();
 	void destroyPrevNextButtons();
 
+	bool hasPlaybackSpeedControl() const;
 	void updateVolumeToggleIcon();
 
 	void checkForTypeChange();
@@ -91,8 +90,10 @@ private:
 	void updateTimeText(const TrackState &state);
 	void updateTimeLabel();
 
-	TimeMs _seekPositionMs = -1;
-	TimeMs _lastDurationMs = 0;
+	const not_null<Main::Session*> _session;
+
+	crl::time _seekPositionMs = -1;
+	crl::time _lastDurationMs = 0;
 	QString _time;
 
 	// We display all the controls according to _type.
@@ -100,8 +101,10 @@ private:
 	// We switch to Type::Song only if _voiceIsActive == false.
 	// We change _voiceIsActive to false only manually or from tracksFinished().
 	AudioMsgId::Type _type = AudioMsgId::Type::Unknown;
+	AudioMsgId _lastSongId;
 	bool _voiceIsActive = false;
-	base::lambda<void()> _closeCallback;
+	Fn<void()> _closeCallback;
+	Fn<void(not_null<const HistoryItem*>)> _showItemCallback;
 
 	bool _labelsOver = false;
 	bool _labelsDown = false;
@@ -114,12 +117,15 @@ private:
 	object_ptr<Ui::IconButton> _nextTrack = { nullptr };
 	object_ptr<Ui::IconButton> _volumeToggle;
 	object_ptr<Ui::IconButton> _repeatTrack;
+	object_ptr<Ui::IconButton> _playbackSpeed;
 	object_ptr<Ui::IconButton> _close;
 	object_ptr<Ui::PlainShadow> _shadow = { nullptr };
 	object_ptr<Ui::FilledSlider> _playbackSlider;
-	std::unique_ptr<Clip::Playback> _playback;
+	std::unique_ptr<View::PlaybackProgress> _playbackProgress;
+
+	rpl::lifetime _playlistChangesLifetime;
 
 };
 
-} // namespace Clip
+} // namespace Player
 } // namespace Media

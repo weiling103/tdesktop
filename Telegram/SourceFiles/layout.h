@@ -1,105 +1,82 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
 #include "base/runtime_composer.h"
 
+namespace HistoryView {
+struct TextState;
+struct StateRequest;
+} // namespace HistoryView
+
+namespace Ui {
+enum CachedRoundCorners : int;
+} // namespace Ui
+
 constexpr auto FullSelection = TextSelection { 0xFFFF, 0xFFFF };
 
-extern TextParseOptions _textNameOptions, _textDlgOptions;
-extern TextParseOptions _historyTextOptions, _historyBotOptions, _historyTextNoMonoOptions, _historyBotNoMonoOptions;
+inline bool IsSubGroupSelection(TextSelection selection) {
+	return (selection.from == 0xFFFF) && (selection.to != 0xFFFF);
+}
 
-const TextParseOptions &itemTextOptions(History *h, PeerData *f);
-const TextParseOptions &itemTextOptions(const HistoryItem *item);
-const TextParseOptions &itemTextNoMonoOptions(History *h, PeerData *f);
-const TextParseOptions &itemTextNoMonoOptions(const HistoryItem *item);
+inline bool IsGroupItemSelection(
+		TextSelection selection,
+		int index) {
+	Expects(index >= 0 && index < 0x0F);
 
-enum RoundCorners {
-	SmallMaskCorners = 0x00, // for images
-	LargeMaskCorners,
+	return IsSubGroupSelection(selection) && (selection.to & (1 << index));
+}
 
-	BoxCorners,
-	MenuCorners,
-	BotKbOverCorners,
-	StickerCorners,
-	StickerSelectedCorners,
-	SelectedOverlaySmallCorners,
-	SelectedOverlayLargeCorners,
-	DateCorners,
-	DateSelectedCorners,
-	ForwardCorners,
-	MediaviewSaveCorners,
-	EmojiHoverCorners,
-	StickerHoverCorners,
-	BotKeyboardCorners,
-	PhotoSelectOverlayCorners,
+[[nodiscard]] inline TextSelection AddGroupItemSelection(
+		TextSelection selection,
+		int index) {
+	Expects(index >= 0 && index < 0x0F);
 
-	Doc1Corners,
-	Doc2Corners,
-	Doc3Corners,
-	Doc4Corners,
+	const auto bit = uint16(1U << index);
+	return TextSelection(
+		0xFFFF,
+		IsSubGroupSelection(selection) ? (selection.to | bit) : bit);
+}
 
-	InShadowCorners, // for photos without bg
-	InSelectedShadowCorners,
+[[nodiscard]] inline TextSelection RemoveGroupItemSelection(
+		TextSelection selection,
+		int index) {
+	Expects(index >= 0 && index < 0x0F);
 
-	MessageInCorners, // with shadow
-	MessageInSelectedCorners,
-	MessageOutCorners,
-	MessageOutSelectedCorners,
-
-	RoundCornersCount
-};
-
-static const int32 FileStatusSizeReady = 0x7FFFFFF0;
-static const int32 FileStatusSizeLoaded = 0x7FFFFFF1;
-static const int32 FileStatusSizeFailed = 0x7FFFFFF2;
-
-QString formatSizeText(qint64 size);
-QString formatDownloadText(qint64 ready, qint64 total);
-QString formatDurationText(qint64 duration);
-QString formatDurationWords(qint64 duration);
-QString formatDurationAndSizeText(qint64 duration, qint64 size);
-QString formatGifAndSizeText(qint64 size);
-QString formatPlayedText(qint64 played, qint64 duration);
+	const auto bit = uint16(1U << index);
+	return IsSubGroupSelection(selection)
+		? TextSelection(0xFFFF, selection.to & ~bit)
+		: selection;
+}
 
 int32 documentColorIndex(DocumentData *document, QString &ext);
 style::color documentColor(int colorIndex);
 style::color documentDarkColor(int colorIndex);
 style::color documentOverColor(int colorIndex);
 style::color documentSelectedColor(int colorIndex);
-RoundCorners documentCorners(int colorIndex);
-bool documentIsValidMediaFile(const QString &filepath);
-bool documentIsExecutableName(const QString &filename);
+Ui::CachedRoundCorners documentCorners(int colorIndex);
 
 class PaintContextBase {
 public:
-	PaintContextBase(TimeMs ms, bool selecting) : ms(ms), selecting(selecting) {
+	PaintContextBase(crl::time ms, bool selecting) : ms(ms), selecting(selecting) {
 	}
-	TimeMs ms;
+	crl::time ms;
 	bool selecting;
 
 };
 
-class LayoutItemBase : public RuntimeComposer, public ClickHandlerHost {
+class LayoutItemBase
+	: public RuntimeComposer<LayoutItemBase>
+	, public ClickHandlerHost {
 public:
+	using TextState = HistoryView::TextState;
+	using StateRequest = HistoryView::StateRequest;
+
 	LayoutItemBase() {
 	}
 
@@ -119,15 +96,12 @@ public:
 		return _height;
 	}
 
-	virtual void getState(ClickHandlerPtr &link, HistoryCursorState &cursor, QPoint point) const {
-		link.clear();
-		cursor = HistoryDefaultCursorState;
-	}
-	virtual void getSymbol(uint16 &symbol, bool &after, bool &upon, QPoint point) const { // from text
-		upon = hasPoint(point);
-		symbol = upon ? 0xFFFF : 0;
-		after = false;
-	}
+	[[nodiscard]] virtual TextState getState(
+		QPoint point,
+		StateRequest request) const;
+	[[nodiscard]] virtual TextSelection adjustSelection(
+		TextSelection selection,
+		TextSelectType type) const;
 
 	int width() const {
 		return _width;

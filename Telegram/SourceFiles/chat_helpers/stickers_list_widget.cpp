@@ -1,182 +1,429 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "chat_helpers/stickers_list_widget.h"
 
-#include "styles/style_chat_helpers.h"
+#include "data/data_document.h"
+#include "data/data_document_media.h"
+#include "data/data_session.h"
+#include "data/data_channel.h"
+#include "data/data_file_origin.h"
+#include "data/data_cloud_file.h"
+#include "data/data_changes.h"
+#include "chat_helpers/send_context_menu.h" // SendMenu::FillSendMenu
+#include "chat_helpers/stickers_lottie.h"
 #include "ui/widgets/buttons.h"
+#include "ui/widgets/popup_menu.h"
+#include "ui/effects/animations.h"
 #include "ui/effects/ripple_animation.h"
+#include "ui/image/image.h"
+#include "ui/cached_round_corners.h"
+#include "lottie/lottie_multi_player.h"
+#include "lottie/lottie_single_player.h"
+#include "lottie/lottie_animation.h"
 #include "boxes/stickers_box.h"
 #include "inline_bots/inline_bot_result.h"
-#include "chat_helpers/stickers.h"
-#include "storage/localstorage.h"
+#include "storage/storage_account.h"
 #include "lang/lang_keys.h"
 #include "mainwindow.h"
 #include "dialogs/dialogs_layout.h"
 #include "boxes/sticker_set_box.h"
 #include "boxes/stickers_box.h"
 #include "boxes/confirm_box.h"
-#include "auth_session.h"
-#include "observer_peer.h"
+#include "window/window_session_controller.h" // GifPauseReason.
+#include "main/main_session.h"
+#include "main/main_session_settings.h"
 #include "apiwrap.h"
+#include "api/api_toggling_media.h" // Api::ToggleFavedSticker
+#include "styles/style_chat_helpers.h"
+#include "styles/style_window.h"
+
+#include <QtWidgets/QApplication>
 
 namespace ChatHelpers {
 namespace {
 
-constexpr auto kStickersPanelPerRow = Stickers::kPanelPerRow;
 constexpr auto kInlineItemsMaxPerRow = 5;
+constexpr auto kSearchRequestDelay = 400;
+constexpr auto kRecentDisplayLimit = 20;
+constexpr auto kPreloadOfficialPages = 4;
+constexpr auto kOfficialLoadLimit = 40;
+
+using Data::StickersSet;
+using Data::StickersPack;
+using Data::StickersSetThumbnailView;
+
+bool SetInMyList(MTPDstickerSet::Flags flags) {
+	return (flags & MTPDstickerSet::Flag::f_installed_date)
+		&& !(flags & MTPDstickerSet::Flag::f_archived);
+}
 
 } // namespace
 
 struct StickerIcon {
 	StickerIcon(uint64 setId) : setId(setId) {
 	}
-	StickerIcon(uint64 setId, DocumentData *sticker, int32 pixw, int32 pixh) : setId(setId), sticker(sticker), pixw(pixw), pixh(pixh) {
+	StickerIcon(
+		not_null<StickersSet*> set,
+		DocumentData *sticker,
+		int pixw,
+		int pixh)
+	: setId(set->id)
+	, set(set)
+	, sticker(sticker)
+	, pixw(pixw)
+	, pixh(pixh) {
 	}
+
+	void ensureMediaCreated() const {
+		if (!sticker) {
+			return;
+		} else if (set->hasThumbnail()) {
+			if (!thumbnailMedia) {
+				thumbnailMedia = set->createThumbnailView();
+				set->loadThumbnail();
+			}
+		} else if (!stickerMedia) {
+			stickerMedia = sticker->createMediaView();
+			stickerMedia->thumbnailWanted(sticker->stickerSetOrigin());
+		}
+	}
+
 	uint64 setId = 0;
+	StickersSet *set = nullptr;
+	mutable std::unique_ptr<Lottie::SinglePlayer> lottie;
+	mutable QPixmap savedFrame;
 	DocumentData *sticker = nullptr;
 	ChannelData *megagroup = nullptr;
+	mutable std::shared_ptr<StickersSetThumbnailView> thumbnailMedia;
+	mutable std::shared_ptr<Data::DocumentMedia> stickerMedia;
+	mutable std::shared_ptr<Data::CloudImageView> megagroupUserpic;
 	int pixw = 0;
 	int pixh = 0;
+	mutable rpl::lifetime lifetime;
 
 };
 
-class StickersListWidget::Footer : public TabbedSelector::InnerFooter, private base::Subscriber {
+class StickersListWidget::Footer : public TabbedSelector::InnerFooter {
 public:
-	Footer(not_null<StickersListWidget*> parent);
+	explicit Footer(not_null<StickersListWidget*> parent);
 
 	void preloadImages();
-	void validateSelectedIcon(uint64 setId, ValidateIconAnimations animations);
+	void validateSelectedIcon(
+		uint64 setId,
+		ValidateIconAnimations animations);
 	void refreshIcons(ValidateIconAnimations animations);
 	bool hasOnlyFeaturedSets() const;
 
 	void leaveToChildEvent(QEvent *e, QWidget *child) override;
 
+	void stealFocus();
+	void returnFocus();
+	void setLoading(bool loading);
+
+	void clearHeavyData();
+
 protected:
 	void paintEvent(QPaintEvent *e) override;
+	void resizeEvent(QResizeEvent *e) override;
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
-	bool event(QEvent *e) override;
+	bool eventHook(QEvent *e) override;
 
 	void processHideFinished() override;
 
 private:
+	enum class SpecialOver {
+		None,
+		Search,
+		Settings,
+	};
+	using OverState = std::variant<SpecialOver, int>;
+
 	template <typename Callback>
 	void enumerateVisibleIcons(Callback callback);
 
-	void step_icons(TimeMs ms, bool timer);
+	bool iconsAnimationCallback(crl::time now);
+	void setSelectedIcon(
+		int newSelected,
+		ValidateIconAnimations animations);
+	void validateIconLottieAnimation(const StickerIcon &icon);
 
+	void refreshIconsGeometry(ValidateIconAnimations animations);
 	void updateSelected();
+	void updateSetIcon(uint64 setId);
+	void finishDragging();
 	void paintStickerSettingsIcon(Painter &p) const;
-	void paintFeaturedStickerSetsBadge(Painter &p, int iconLeft) const;
+	void paintSearchIcon(Painter &p) const;
+	void paintSetIcon(Painter &p, const StickerIcon &icon, int x) const;
+	void paintSelectionBar(Painter &p) const;
+	void paintLeftRightFading(Painter &p) const;
 
-	not_null<StickersListWidget*> _pan;
+	void initSearch();
+	void toggleSearch(bool visible);
+	void resizeSearchControls();
+	void scrollByWheelEvent(not_null<QWheelEvent*> e);
+
+	const not_null<StickersListWidget*> _pan;
 
 	static constexpr auto kVisibleIconsCount = 8;
 
-	QList<StickerIcon> _icons;
-	int _iconOver = -1;
+	std::vector<StickerIcon> _icons;
+	OverState _iconOver = SpecialOver::None;
 	int _iconSel = 0;
-	int _iconDown = -1;
+	OverState _iconDown = SpecialOver::None;
 	bool _iconsDragging = false;
-	BasicAnimation _a_icons;
+	Ui::Animations::Basic _iconsAnimation;
 	QPoint _iconsMousePos, _iconsMouseDown;
 	int _iconsLeft = 0;
+	int _iconsRight = 0;
 	int _iconsTop = 0;
 	int _iconsStartX = 0;
 	int _iconsMax = 0;
 	anim::value _iconsX;
 	anim::value _iconSelX;
-	TimeMs _iconsStartAnim = 0;
+	crl::time _iconsStartAnim = 0;
 
 	bool _horizontal = false;
 
+	bool _searchShown = false;
+	object_ptr<Ui::InputField> _searchField = { nullptr };
+	object_ptr<Ui::CrossButton> _searchCancel = { nullptr };
+	QPointer<QWidget> _focusTakenFrom;
+
 };
 
-StickersListWidget::Footer::Footer(not_null<StickersListWidget*> parent) : InnerFooter(parent)
+auto StickersListWidget::PrepareStickers(
+	const QVector<DocumentData*> &pack)
+-> std::vector<Sticker> {
+	return ranges::views::all(
+		pack
+	) | ranges::views::transform([](DocumentData *document) {
+		return Sticker{ document };
+	}) | ranges::to_vector;
+}
+
+StickersListWidget::Set::Set(
+	uint64 id,
+	StickersSet *set,
+	MTPDstickerSet::Flags flags,
+	const QString &title,
+	const QString &shortName,
+	int count,
+	bool externalLayout,
+	std::vector<Sticker> &&stickers)
+: id(id)
+, set(set)
+, flags(flags)
+, title(title)
+, shortName(shortName)
+, stickers(std::move(stickers))
+, count(count)
+, externalLayout(externalLayout) {
+}
+
+StickersListWidget::Set::Set(Set &&other) = default;
+StickersListWidget::Set &StickersListWidget::Set::operator=(
+	Set &&other) = default;
+StickersListWidget::Set::~Set() = default;
+
+
+void StickersListWidget::Sticker::ensureMediaCreated() {
+	if (documentMedia) {
+		return;
+	}
+	documentMedia = document->createMediaView();
+}
+
+StickersListWidget::Footer::Footer(not_null<StickersListWidget*> parent)
+: InnerFooter(parent)
 , _pan(parent)
-, _a_icons(animation(this, &Footer::step_icons)) {
+, _iconsAnimation([=](crl::time now) {
+	return iconsAnimationCallback(now);
+}) {
 	setMouseTracking(true);
 
-	_iconsLeft = (st::emojiPanWidth - kVisibleIconsCount * st::emojiCategory.width) / 2;
+	_iconsLeft = _iconsRight = st::emojiCategorySkip + st::stickerIconWidth;
 
-	subscribe(Auth().downloaderTaskFinished(), [this] {
+	_pan->session().downloaderTaskFinished(
+	) | rpl::start_with_next([=] {
 		update();
+	}, lifetime());
+}
+
+void StickersListWidget::Footer::clearHeavyData() {
+	const auto count = int(_icons.size());
+	const auto iconsX = qRound(_iconsX.current());
+	const auto first = floorclamp(iconsX, st::stickerIconWidth, 0, count);
+	const auto last = ceilclamp(
+		iconsX + width(),
+		st::stickerIconWidth,
+		0,
+		count);
+	for (auto i = 0; i != count; ++i) {
+		auto &icon = _icons[i];
+		icon.lottie = nullptr;
+		icon.lifetime.destroy();
+		icon.stickerMedia = nullptr;
+		if (i < first || i >= last) {
+			// Not visible icon.
+			icon.savedFrame = QPixmap();
+		}
+	}
+}
+
+void StickersListWidget::Footer::initSearch() {
+	_searchField.create(
+		this,
+		st::gifsSearchField,
+		tr::lng_stickers_search_sets());
+	_searchCancel.create(this, st::gifsSearchCancel);
+	_searchField->show();
+	_searchCancel->show(anim::type::instant);
+
+	const auto cancelSearch = [=] {
+		if (_searchField->getLastText().isEmpty()) {
+			toggleSearch(false);
+		} else {
+			_searchField->setText(QString());
+		}
+	};
+	connect(_searchField, &Ui::InputField::submitted, [=] {
+		_pan->sendSearchRequest();
 	});
+	connect(_searchField, &Ui::InputField::cancelled, cancelSearch);
+	connect(_searchField, &Ui::InputField::changed, [=] {
+		_pan->searchForSets(_searchField->getLastText());
+	});
+	_searchCancel->setClickedCallback(cancelSearch);
+
+	resizeSearchControls();
+}
+
+void StickersListWidget::Footer::toggleSearch(bool visible) {
+	if (_searchShown == visible) {
+		return;
+	}
+	_searchShown = visible;
+	if (_searchShown) {
+		initSearch();
+		stealFocus();
+	} else if (_searchField) {
+		returnFocus();
+		_searchField.destroy();
+		_searchCancel.destroy();
+		_focusTakenFrom = nullptr;
+	}
+	update();
+}
+
+void StickersListWidget::Footer::stealFocus() {
+	if (_searchField) {
+		if (!_focusTakenFrom) {
+			_focusTakenFrom = QApplication::focusWidget();
+		}
+		_searchField->setFocus();
+	}
+}
+
+void StickersListWidget::Footer::returnFocus() {
+	if (_searchField && _focusTakenFrom) {
+		if (_searchField->hasFocus()) {
+			_focusTakenFrom->setFocus();
+		}
+		_focusTakenFrom = nullptr;
+	}
 }
 
 template <typename Callback>
 void StickersListWidget::Footer::enumerateVisibleIcons(Callback callback) {
 	auto iconsX = qRound(_iconsX.current());
-	auto index = iconsX / st::emojiCategory.width;
-	auto x = _iconsLeft - (iconsX % st::emojiCategory.width);
-	for (auto index = qMin(_icons.size(), iconsX / st::emojiCategory.width),
-		last = qMin(_icons.size(), index + kVisibleIconsCount); index != last; ++index) {
+	auto index = iconsX / st::stickerIconWidth;
+	auto x = _iconsLeft - (iconsX % st::stickerIconWidth);
+	auto first = floorclamp(iconsX, st::stickerIconWidth, 0, _icons.size());
+	auto last = ceilclamp(iconsX + width(), st::stickerIconWidth, 0, _icons.size());
+	for (auto index = first; index != last; ++index) {
 		callback(_icons[index], x);
-		x += st::emojiCategory.width;
+		x += st::stickerIconWidth;
 	}
 }
 
 void StickersListWidget::Footer::preloadImages() {
-	enumerateVisibleIcons([this](const StickerIcon &icon, int x) {
-		if (auto sticker = icon.sticker) {
-			sticker->thumb->load();
+	enumerateVisibleIcons([](const StickerIcon &icon, int x) {
+		if (const auto sticker = icon.sticker) {
+			Assert(icon.set != nullptr);
+			if (icon.set->hasThumbnail()) {
+				icon.set->loadThumbnail();
+			} else {
+				sticker->loadThumbnail(sticker->stickerSetOrigin());
+			}
 		}
 	});
 }
 
-void StickersListWidget::Footer::validateSelectedIcon(uint64 setId, ValidateIconAnimations animations) {
-	auto newSel = 0;
-	for (auto i = 0, l = _icons.size(); i != l; ++i) {
-		if (_icons[i].setId == setId) {
-			newSel = i;
+void StickersListWidget::Footer::validateSelectedIcon(
+		uint64 setId,
+		ValidateIconAnimations animations) {
+	auto favedIconIndex = -1;
+	auto newSelected = -1;
+	for (auto i = 0, l = int(_icons.size()); i != l; ++i) {
+		if (_icons[i].setId == setId
+			|| (_icons[i].setId == Data::Stickers::FavedSetId
+				&& setId == Data::Stickers::RecentSetId)) {
+			newSelected = i;
 			break;
+		} else if (_icons[i].setId == Data::Stickers::FavedSetId) {
+			favedIconIndex = i;
 		}
 	}
-	if (newSel != _iconSel) {
-		_iconSel = newSel;
-		auto iconSelXFinal = _iconSel * st::emojiCategory.width;
-		if (animations == ValidateIconAnimations::Full) {
-			_iconSelX.start(iconSelXFinal);
-		} else {
-			_iconSelX = anim::value(iconSelXFinal, iconSelXFinal);
-		}
-		auto iconsXFinal = snap((2 * _iconSel + 1 - kVisibleIconsCount) * st::emojiCategory.width / 2, 0, _iconsMax);
-		if (animations == ValidateIconAnimations::None) {
-			_iconsX = anim::value(iconsXFinal, iconsXFinal);
-			_a_icons.stop();
-		} else {
-			_iconsX.start(iconsXFinal);
-			_iconsStartAnim = getms();
-			_a_icons.start();
-		}
-		updateSelected();
-		update();
+	setSelectedIcon(
+		(newSelected >= 0
+			? newSelected
+			: (favedIconIndex >= 0) ? favedIconIndex : 0),
+		animations);
+}
+
+void StickersListWidget::Footer::setSelectedIcon(
+		int newSelected,
+		ValidateIconAnimations animations) {
+	if (_iconSel == newSelected) {
+		return;
 	}
+	_iconSel = newSelected;
+	auto iconSelXFinal = _iconSel * st::stickerIconWidth;
+	if (animations == ValidateIconAnimations::Full) {
+		_iconSelX.start(iconSelXFinal);
+	} else {
+		_iconSelX = anim::value(iconSelXFinal, iconSelXFinal);
+	}
+	auto iconsCountForCentering = (2 * _iconSel + 1);
+	auto iconsWidthForCentering = iconsCountForCentering
+		* st::stickerIconWidth;
+	auto iconsXFinal = std::clamp(
+		(_iconsLeft + iconsWidthForCentering + _iconsRight - width()) / 2,
+		0,
+		_iconsMax);
+	if (animations == ValidateIconAnimations::None) {
+		_iconsX = anim::value(iconsXFinal, iconsXFinal);
+		_iconsAnimation.stop();
+	} else {
+		_iconsX.start(iconsXFinal);
+		_iconsStartAnim = crl::now();
+		_iconsAnimation.start();
+	}
+	updateSelected();
+	update();
 }
 
 void StickersListWidget::Footer::processHideFinished() {
-	_iconOver = _iconDown = -1;
+	_iconOver = _iconDown = SpecialOver::None;
 	_iconsStartAnim = 0;
-	_a_icons.stop();
+	_iconsAnimation.stop();
 	_iconsX.finish();
 	_iconSelX.finish();
 	_horizontal = false;
@@ -187,10 +434,18 @@ void StickersListWidget::Footer::leaveToChildEvent(QEvent *e, QWidget *child) {
 	updateSelected();
 }
 
+void StickersListWidget::Footer::setLoading(bool loading) {
+	if (_searchCancel) {
+		_searchCancel->setLoadingAnimation(loading);
+	}
+}
+
 void StickersListWidget::Footer::paintEvent(QPaintEvent *e) {
 	Painter p(this);
 
-	if (_icons.isEmpty()) {
+	paintSearchIcon(p);
+
+	if (_icons.empty() || _searchShown) {
 		return;
 	}
 
@@ -198,52 +453,77 @@ void StickersListWidget::Footer::paintEvent(QPaintEvent *e) {
 		paintStickerSettingsIcon(p);
 	}
 
-	auto selxrel = _iconsLeft + qRound(_iconSelX.current());
-	auto selx = selxrel - qRound(_iconsX.current());
-
-	auto clip = QRect(_iconsLeft, _iconsTop, _iconsLeft + (kVisibleIconsCount - 1) * st::emojiCategory.width - _iconsLeft, st::emojiCategory.height);
-	if (rtl()) clip.moveLeft(width() - _iconsLeft - clip.width());
+	auto clip = QRect(
+		_iconsLeft,
+		_iconsTop,
+		width() - _iconsLeft - _iconsRight,
+		st::emojiFooterHeight);
+	if (rtl()) {
+		clip.moveLeft(width() - _iconsLeft - clip.width());
+	}
 	p.setClipRect(clip);
 
-	enumerateVisibleIcons([this, &p](const StickerIcon &icon, int x) {
-		if (icon.sticker) {
-			icon.sticker->thumb->load();
-			auto pix = icon.sticker->thumb->pix(icon.pixw, icon.pixh);
-
-			p.drawPixmapLeft(x + (st::emojiCategory.width - icon.pixw) / 2, _iconsTop + (st::emojiCategory.height - icon.pixh) / 2, width(), pix);
-		} else if (icon.megagroup) {
-			icon.megagroup->paintUserpicLeft(p, x + (st::emojiCategory.width - st::stickerGroupCategorySize) / 2, _iconsTop + (st::emojiCategory.height - st::stickerGroupCategorySize) / 2, width(), st::stickerGroupCategorySize);
-		} else {
-			auto getSpecialSetIcon = [](uint64 setId) {
-				if (setId == Stickers::FeaturedSetId) {
-					return &st::stickersTrending;
-				} else if (setId == Stickers::FavedSetId) {
-					return &st::stickersFaved;
-				}
-				return &st::emojiRecent;
-			};
-			getSpecialSetIcon(icon.setId)->paint(p, x + st::emojiCategory.iconPosition.x(), _iconsTop + st::emojiCategory.iconPosition.y(), width());
-			if (icon.setId == Stickers::FeaturedSetId) {
-				paintFeaturedStickerSetsBadge(p, x);
-			}
-		}
+	enumerateVisibleIcons([&](const StickerIcon &icon, int x) {
+		paintSetIcon(p, icon, x);
 	});
 
-	if (rtl()) selx = width() - selx - st::emojiCategory.width;
-	p.fillRect(selx, _iconsTop + st::emojiCategory.height - st::stickerIconPadding, st::emojiCategory.width, st::stickerIconSel, st::stickerIconSelColor);
+	paintSelectionBar(p);
+	paintLeftRightFading(p);
+}
 
-	auto o_left = snap(_iconsX.current() / st::stickerIconLeft.width(), 0., 1.);
+void StickersListWidget::Footer::paintSelectionBar(Painter &p) const {
+	auto selxrel = _iconsLeft + qRound(_iconSelX.current());
+	auto selx = selxrel - qRound(_iconsX.current());
+	if (rtl()) {
+		selx = width() - selx - st::stickerIconWidth;
+	}
+	p.fillRect(
+		selx,
+		_iconsTop + st::emojiFooterHeight - st::stickerIconPadding,
+		st::stickerIconWidth,
+		st::stickerIconSel,
+		st::stickerIconSelColor);
+}
+
+void StickersListWidget::Footer::paintLeftRightFading(Painter &p) const {
+	auto o_left = std::clamp(
+		_iconsX.current() / st::stickerIconLeft.width(),
+		0.,
+		1.);
 	if (o_left > 0) {
 		p.setOpacity(o_left);
-		st::stickerIconLeft.fill(p, rtlrect(_iconsLeft, _iconsTop, st::stickerIconLeft.width(), st::emojiCategory.height, width()));
+		st::stickerIconLeft.fill(p, style::rtlrect(_iconsLeft, _iconsTop, st::stickerIconLeft.width(), st::emojiFooterHeight, width()));
 		p.setOpacity(1.);
 	}
-	auto o_right = snap((_iconsMax - _iconsX.current()) / st::stickerIconRight.width(), 0., 1.);
+	auto o_right = std::clamp(
+		(_iconsMax - _iconsX.current()) / st::stickerIconRight.width(),
+		0.,
+		1.);
 	if (o_right > 0) {
 		p.setOpacity(o_right);
-		st::stickerIconRight.fill(p, rtlrect(_iconsLeft + (kVisibleIconsCount - 1) * st::emojiCategory.width - st::stickerIconRight.width(), _iconsTop, st::stickerIconRight.width(), st::emojiCategory.height, width()));
+		st::stickerIconRight.fill(p, style::rtlrect(width() - _iconsRight - st::stickerIconRight.width(), _iconsTop, st::stickerIconRight.width(), st::emojiFooterHeight, width()));
 		p.setOpacity(1.);
 	}
+}
+
+void StickersListWidget::Footer::resizeEvent(QResizeEvent *e) {
+	if (_searchField) {
+		resizeSearchControls();
+	}
+	refreshIconsGeometry(ValidateIconAnimations::None);
+}
+
+void StickersListWidget::Footer::resizeSearchControls() {
+	Expects(_searchField != nullptr);
+	Expects(_searchCancel != nullptr);
+
+	const auto fieldWidth = width()
+		- st::gifsSearchFieldPosition.x()
+		- st::gifsSearchCancelPosition.x()
+		- st::gifsSearchCancel.width;
+	_searchField->resizeToWidth(fieldWidth);
+	_searchField->moveToLeft(st::gifsSearchFieldPosition.x(), st::gifsSearchFieldPosition.y());
+	_searchCancel->moveToRight(st::gifsSearchCancelPosition.x(), st::gifsSearchCancelPosition.y());
 }
 
 void StickersListWidget::Footer::mousePressEvent(QMouseEvent *e) {
@@ -253,8 +533,14 @@ void StickersListWidget::Footer::mousePressEvent(QMouseEvent *e) {
 	_iconsMousePos = e ? e->globalPos() : QCursor::pos();
 	updateSelected();
 
-	if (_iconOver == _icons.size()) {
-		Ui::show(Box<StickersBox>(hasOnlyFeaturedSets() ? StickersBox::Section::Featured : StickersBox::Section::Installed));
+	if (_iconOver == SpecialOver::Settings) {
+		_pan->controller()->show(Box<StickersBox>(
+			_pan->controller(),
+			(hasOnlyFeaturedSets()
+				? StickersBox::Section::Featured
+				: StickersBox::Section::Installed)));
+	} else if (_iconOver == SpecialOver::Search) {
+		toggleSearch(true);
 	} else {
 		_iconDown = _iconOver;
 		_iconsMouseDown = _iconsMousePos;
@@ -266,119 +552,191 @@ void StickersListWidget::Footer::mouseMoveEvent(QMouseEvent *e) {
 	_iconsMousePos = e ? e->globalPos() : QCursor::pos();
 	updateSelected();
 
-	if (!_iconsDragging && !_icons.isEmpty() && _iconDown >= 0) {
+	if (!_iconsDragging
+		&& !_icons.empty()
+		&& v::is<int>(_iconDown)) {
 		if ((_iconsMousePos - _iconsMouseDown).manhattanLength() >= QApplication::startDragDistance()) {
 			_iconsDragging = true;
 		}
 	}
 	if (_iconsDragging) {
-		auto newX = snap(_iconsStartX + (rtl() ? -1 : 1) * (_iconsMouseDown.x() - _iconsMousePos.x()), 0, _iconsMax);
+		auto newX = std::clamp(
+			(rtl() ? -1 : 1) * (_iconsMouseDown.x() - _iconsMousePos.x())
+				+ _iconsStartX,
+			0,
+			_iconsMax);
 		if (newX != qRound(_iconsX.current())) {
 			_iconsX = anim::value(newX, newX);
 			_iconsStartAnim = 0;
-			_a_icons.stop();
+			_iconsAnimation.stop();
 			update();
 		}
 	}
 }
 
 void StickersListWidget::Footer::mouseReleaseEvent(QMouseEvent *e) {
-	if (_icons.isEmpty()) {
+	if (_icons.empty()) {
 		return;
 	}
 
-	auto wasDown = _iconDown;
-	_iconDown = -1;
+	const auto wasDown = std::exchange(_iconDown, SpecialOver::None);
 
 	_iconsMousePos = e ? e->globalPos() : QCursor::pos();
 	if (_iconsDragging) {
-		auto newX = snap(_iconsStartX + _iconsMouseDown.x() - _iconsMousePos.x(), 0, _iconsMax);
-		if (newX != qRound(_iconsX.current())) {
-			_iconsX = anim::value(newX, newX);
-			_iconsStartAnim = 0;
-			_a_icons.stop();
-			update();
-		}
-		_iconsDragging = false;
-		updateSelected();
-	} else {
-		updateSelected();
+		finishDragging();
+		return;
+	}
 
-		if (wasDown == _iconOver && _iconOver >= 0 && _iconOver < _icons.size()) {
-			_iconSelX = anim::value(_iconOver * st::emojiCategory.width, _iconOver * st::emojiCategory.width);
-			_pan->showStickerSet(_icons[_iconOver].setId);
+	updateSelected();
+	if (wasDown == _iconOver) {
+		if (const auto index = std::get_if<int>(&_iconOver)) {
+			_iconSelX = anim::value(
+				*index * st::stickerIconWidth,
+				*index * st::stickerIconWidth);
+			_pan->showStickerSet(_icons[*index].setId);
 		}
 	}
 }
 
-bool StickersListWidget::Footer::event(QEvent *e) {
-	if (e->type() == QEvent::TouchBegin) {
+void StickersListWidget::Footer::finishDragging() {
+	auto newX = std::clamp(
+		_iconsStartX + _iconsMouseDown.x() - _iconsMousePos.x(),
+		0,
+		_iconsMax);
+	if (newX != qRound(_iconsX.current())) {
+		_iconsX = anim::value(newX, newX);
+		_iconsStartAnim = 0;
+		_iconsAnimation.stop();
+		update();
+	}
+	_iconsDragging = false;
+	updateSelected();
+}
 
+bool StickersListWidget::Footer::eventHook(QEvent *e) {
+	if (e->type() == QEvent::TouchBegin) {
 	} else if (e->type() == QEvent::Wheel) {
-		if (!_icons.isEmpty() && _iconOver >= 0 && _iconOver < _icons.size() && _iconDown < 0) {
-			auto ev = static_cast<QWheelEvent*>(e);
-			auto horizontal = (ev->angleDelta().x() != 0 || ev->orientation() == Qt::Horizontal);
-			auto vertical = (ev->angleDelta().y() != 0 || ev->orientation() == Qt::Vertical);
-			if (horizontal) _horizontal = true;
-			auto newX = qRound(_iconsX.current());
-			if (/*_horizontal && */horizontal) {
-				newX = snap(newX - (rtl() ? -1 : 1) * (ev->pixelDelta().x() ? ev->pixelDelta().x() : ev->angleDelta().x()), 0, _iconsMax);
-			} else if (/*!_horizontal && */vertical) {
-				newX = snap(newX - (ev->pixelDelta().y() ? ev->pixelDelta().y() : ev->angleDelta().y()), 0, _iconsMax);
-			}
-			if (newX != qRound(_iconsX.current())) {
-				_iconsX = anim::value(newX, newX);
-				_iconsStartAnim = 0;
-				_a_icons.stop();
-				updateSelected();
-				update();
-			}
+		if (!_icons.empty()
+			&& v::is<int>(_iconOver)
+			&& (_iconDown == SpecialOver::None)) {
+			scrollByWheelEvent(static_cast<QWheelEvent*>(e));
 		}
 	}
-	return TWidget::event(e);
+	return InnerFooter::eventHook(e);
+}
+
+void StickersListWidget::Footer::scrollByWheelEvent(
+		not_null<QWheelEvent*> e) {
+	auto horizontal = (e->angleDelta().x() != 0);
+	auto vertical = (e->angleDelta().y() != 0);
+	if (horizontal) {
+		_horizontal = true;
+	}
+	auto newX = qRound(_iconsX.current());
+	if (/*_horizontal && */horizontal) {
+		newX = std::clamp(
+			newX - (rtl() ? -1 : 1) * (e->pixelDelta().x()
+				? e->pixelDelta().x()
+				: e->angleDelta().x()),
+			0,
+			_iconsMax);
+	} else if (/*!_horizontal && */vertical) {
+		newX = std::clamp(
+			newX - (e->pixelDelta().y()
+				? e->pixelDelta().y()
+				: e->angleDelta().y()),
+			0,
+			_iconsMax);
+	}
+	if (newX != qRound(_iconsX.current())) {
+		_iconsX = anim::value(newX, newX);
+		_iconsStartAnim = 0;
+		_iconsAnimation.stop();
+		updateSelected();
+		update();
+	}
 }
 
 void StickersListWidget::Footer::updateSelected() {
-	if (_iconDown >= 0) {
+	if (_iconDown != SpecialOver::None) {
 		return;
 	}
 
 	auto p = mapFromGlobal(_iconsMousePos);
-	int32 x = p.x(), y = p.y(), newOver = -1;
+	auto x = p.x(), y = p.y();
 	if (rtl()) x = width() - x;
-	x -= _iconsLeft;
-	if (x >= st::emojiCategory.width * (kVisibleIconsCount - 1) && x < st::emojiCategory.width * kVisibleIconsCount && y >= _iconsTop && y < _iconsTop + st::emojiCategory.height) {
-		if (!_icons.isEmpty() && !hasOnlyFeaturedSets()) {
-			newOver = _icons.size();
+	const auto settingsLeft = width() - _iconsRight;
+	const auto searchLeft = _iconsLeft - st::stickerIconWidth;
+	auto newOver = OverState(SpecialOver::None);
+	if (x >= searchLeft
+		&& x < searchLeft + st::stickerIconWidth
+		&& y >= _iconsTop
+		&& y < _iconsTop + st::emojiFooterHeight) {
+		newOver = SpecialOver::Search;
+	} else if (x >= settingsLeft
+		&& x < settingsLeft + st::stickerIconWidth
+		&& y >= _iconsTop
+		&& y < _iconsTop + st::emojiFooterHeight) {
+		if (!_icons.empty() && !hasOnlyFeaturedSets()) {
+			newOver = SpecialOver::Settings;
 		}
-	} else if (!_icons.isEmpty()) {
-		if (y >= _iconsTop && y < _iconsTop + st::emojiCategory.height && x >= 0 && x < (kVisibleIconsCount - 1) * st::emojiCategory.width && x < _icons.size() * st::emojiCategory.width) {
-			x += qRound(_iconsX.current());
-			newOver = qFloor(x / st::emojiCategory.width);
+	} else if (!_icons.empty()) {
+		if (y >= _iconsTop
+			&& y < _iconsTop + st::emojiFooterHeight
+			&& x >= _iconsLeft
+			&& x < width() - _iconsRight) {
+			x += qRound(_iconsX.current()) - _iconsLeft;
+			if (x < _icons.size() * st::stickerIconWidth) {
+				newOver = qFloor(x / st::stickerIconWidth);
+			}
 		}
 	}
 	if (newOver != _iconOver) {
-		if (newOver < 0) {
+		if (newOver == SpecialOver::None) {
 			setCursor(style::cur_default);
-		} else if (_iconOver < 0) {
+		} else if (_iconOver == SpecialOver::None) {
 			setCursor(style::cur_pointer);
 		}
 		_iconOver = newOver;
 	}
 }
 
-void StickersListWidget::Footer::refreshIcons(ValidateIconAnimations animations) {
-	_iconOver = -1;
-	_pan->fillIcons(_icons);
+void StickersListWidget::Footer::refreshIcons(
+		ValidateIconAnimations animations) {
+	auto icons = _pan->fillIcons();
+
+	auto indices = base::flat_map<uint64, int>();
+	indices.reserve(_icons.size());
+	auto index = 0;
+	for (const auto &entry : _icons) {
+		indices.emplace(entry.setId, index++);
+	}
+
+	for (auto &now : icons) {
+		if (const auto i = indices.find(now.setId); i != end(indices)) {
+			auto &was = _icons[i->second];
+			if (now.sticker == was.sticker) {
+				now.lottie = std::move(was.lottie);
+				now.lifetime = std::move(was.lifetime);
+				now.savedFrame = std::move(was.savedFrame);
+			}
+		}
+	}
+
+	_icons = std::move(icons);
+	refreshIconsGeometry(animations);
+}
+
+void StickersListWidget::Footer::refreshIconsGeometry(
+		ValidateIconAnimations animations) {
+	_iconOver = _iconDown = SpecialOver::None;
 	_iconsX.finish();
 	_iconSelX.finish();
 	_iconsStartAnim = 0;
-	_a_icons.stop();
-	if (_icons.isEmpty()) {
-		_iconsMax = 0;
-	} else {
-		_iconsMax = qMax(int((_icons.size() + 1 - kVisibleIconsCount) * st::emojiCategory.width), 0);
-	}
+	_iconsAnimation.stop();
+	_iconsMax = std::max(
+		_iconsLeft + int(_icons.size()) * st::stickerIconWidth + _iconsRight - width(),
+		0);
 	if (_iconsX.current() > _iconsMax) {
 		_iconsX = anim::value(_iconsMax, _iconsMax);
 	}
@@ -388,36 +746,139 @@ void StickersListWidget::Footer::refreshIcons(ValidateIconAnimations animations)
 }
 
 bool StickersListWidget::Footer::hasOnlyFeaturedSets() const {
-	return (_icons.size() == 1) && (_icons[0].setId == Stickers::FeaturedSetId);
+	return (_icons.size() == 1)
+		&& (_icons[0].setId == Data::Stickers::FeaturedSetId);
 }
 
 void StickersListWidget::Footer::paintStickerSettingsIcon(Painter &p) const {
-	int settingsLeft = _iconsLeft + (kVisibleIconsCount - 1) * st::emojiCategory.width;
-	st::stickersSettings.paint(p, settingsLeft + st::emojiCategory.iconPosition.x(), _iconsTop + st::emojiCategory.iconPosition.y(), width());
+	const auto settingsLeft = width() - _iconsRight;
+	st::stickersSettings.paint(p, settingsLeft + (st::stickerIconWidth - st::stickersSettings.width()) / 2, _iconsTop + st::emojiCategory.iconPosition.y(), width());
 }
 
-void StickersListWidget::Footer::paintFeaturedStickerSetsBadge(Painter &p, int iconLeft) const {
-	if (auto unread = Global::FeaturedStickerSetsUnreadCount()) {
-		Dialogs::Layout::UnreadBadgeStyle unreadSt;
-		unreadSt.sizeId = Dialogs::Layout::UnreadBadgeInStickersPanel;
-		unreadSt.size = st::stickersSettingsUnreadSize;
-		int unreadRight = iconLeft + st::emojiCategory.width - st::stickersSettingsUnreadPosition.x();
-		if (rtl()) unreadRight = width() - unreadRight;
-		int unreadTop = _iconsTop + st::stickersSettingsUnreadPosition.y();
-		Dialogs::Layout::paintUnreadCount(p, QString::number(unread), unreadRight, unreadTop, unreadSt);
+void StickersListWidget::Footer::paintSearchIcon(Painter &p) const {
+	const auto searchLeft = _iconsLeft - st::stickerIconWidth;
+	st::stickersSearch.paint(p, searchLeft + (st::stickerIconWidth - st::stickersSearch.width()) / 2, _iconsTop + st::emojiCategory.iconPosition.y(), width());
+}
+
+void StickersListWidget::Footer::validateIconLottieAnimation(
+		const StickerIcon &icon) {
+	icon.ensureMediaCreated();
+	if (icon.lottie
+		|| !icon.sticker
+		|| !HasLottieThumbnail(
+			icon.thumbnailMedia.get(),
+			icon.stickerMedia.get())) {
+		return;
+	}
+	auto player = LottieThumbnail(
+		icon.thumbnailMedia.get(),
+		icon.stickerMedia.get(),
+		StickerLottieSize::StickersFooter,
+		QSize(
+			st::stickerIconWidth - 2 * st::stickerIconPadding,
+			st::emojiFooterHeight - 2 * st::stickerIconPadding
+		) * cIntRetinaFactor(),
+		_pan->getLottieRenderer());
+	if (!player) {
+		return;
+	}
+	icon.lottie = std::move(player);
+
+	const auto id = icon.setId;
+	icon.lottie->updates(
+	) | rpl::start_with_next([=] {
+		updateSetIcon(id);
+	}, icon.lifetime);
+}
+
+void StickersListWidget::Footer::updateSetIcon(uint64 setId) {
+	enumerateVisibleIcons([&](const StickerIcon &icon, int x) {
+		if (icon.setId != setId) {
+			return;
+		}
+		update(x, _iconsTop, st::stickerIconWidth, st::emojiFooterHeight);
+	});
+}
+
+void StickersListWidget::Footer::paintSetIcon(
+		Painter &p,
+		const StickerIcon &icon,
+		int x) const {
+	if (icon.sticker) {
+		icon.ensureMediaCreated();
+		const_cast<Footer*>(this)->validateIconLottieAnimation(icon);
+		const auto origin = icon.sticker->stickerSetOrigin();
+		const auto thumb = icon.thumbnailMedia
+			? icon.thumbnailMedia->image()
+			: icon.stickerMedia
+			? icon.stickerMedia->thumbnail()
+			: nullptr;
+		if (!icon.lottie
+			|| (!icon.lottie->ready() && !icon.savedFrame.isNull())) {
+			const auto pixmap = !icon.savedFrame.isNull()
+				? icon.savedFrame
+				: (!icon.lottie && thumb)
+				? thumb->pix(icon.pixw, icon.pixh)
+				: QPixmap();
+			if (pixmap.isNull()) {
+				return;
+			} else if (icon.savedFrame.isNull()) {
+				icon.savedFrame = pixmap;
+			}
+			p.drawPixmapLeft(
+				x + (st::stickerIconWidth - icon.pixw) / 2,
+				_iconsTop + (st::emojiFooterHeight - icon.pixh) / 2,
+				width(),
+				pixmap);
+		} else if (icon.lottie->ready()) {
+			const auto frame = icon.lottie->frame();
+			const auto size = frame.size() / cIntRetinaFactor();
+			if (icon.savedFrame.isNull()) {
+				icon.savedFrame = QPixmap::fromImage(frame, Qt::ColorOnly);
+				icon.savedFrame.setDevicePixelRatio(cRetinaFactor());
+			}
+			p.drawImage(
+				QRect(
+					x + (st::stickerIconWidth - size.width()) / 2,
+					_iconsTop + (st::emojiFooterHeight - size.height()) / 2,
+					size.width(),
+					size.height()),
+				frame);
+			const auto paused = _pan->controller()->isGifPausedAtLeastFor(
+				Window::GifPauseReason::SavedGifs);
+			if (!paused) {
+				icon.lottie->markFrameShown();
+			}
+		}
+	} else if (icon.megagroup) {
+		icon.megagroup->paintUserpicLeft(p, icon.megagroupUserpic, x + (st::stickerIconWidth - st::stickerGroupCategorySize) / 2, _iconsTop + (st::emojiFooterHeight - st::stickerGroupCategorySize) / 2, width(), st::stickerGroupCategorySize);
+	} else {
+		const auto paintedIcon = [&] {
+			if (icon.setId == Data::Stickers::FeaturedSetId) {
+				const auto session = &_pan->session();
+				return session->data().stickers().featuredSetsUnreadCount()
+					? &st::stickersTrendingUnread
+					: &st::stickersTrending;
+			//} else if (setId == Stickers::FavedSetId) {
+			//	return &st::stickersFaved;
+			}
+			return &st::stickersRecent;
+		}();
+		paintedIcon->paint(
+			p,
+			x + (st::stickerIconWidth - paintedIcon->width()) / 2,
+			_iconsTop + (st::emojiFooterHeight - paintedIcon->height()) / 2,
+			width());
 	}
 }
 
-void StickersListWidget::validateSelectedIcon(ValidateIconAnimations animations) {
-	if (_footer) {
-		_footer->validateSelectedIcon(currentSet(getVisibleTop()), animations);
+bool StickersListWidget::Footer::iconsAnimationCallback(crl::time now) {
+	if (anim::Disabled()) {
+		now += st::stickerIconMove;
 	}
-}
-
-void StickersListWidget::Footer::step_icons(TimeMs ms, bool timer) {
 	if (_iconsStartAnim) {
-		auto dt = (ms - _iconsStartAnim) / float64(st::stickerIconMove);
-		if (dt >= 1) {
+		const auto dt = (now - _iconsStartAnim) / float64(st::stickerIconMove);
+		if (dt >= 1.) {
 			_iconsStartAnim = 0;
 			_iconsX.finish();
 			_iconSelX.finish();
@@ -427,102 +888,226 @@ void StickersListWidget::Footer::step_icons(TimeMs ms, bool timer) {
 		}
 	}
 
-	if (timer) update();
+	update();
 
-	if (!_iconsStartAnim) {
-		_a_icons.stop();
-	}
+	return (_iconsStartAnim != 0);
 }
 
-StickersListWidget::StickersListWidget(QWidget *parent, not_null<Window::Controller*> controller) : Inner(parent, controller)
+StickersListWidget::StickersListWidget(
+	QWidget *parent,
+	not_null<Window::SessionController*> controller)
+: Inner(parent, controller)
+, _api(&controller->session().mtp())
 , _section(Section::Stickers)
-, _megagroupSetAbout(st::emojiPanWidth - st::emojiScroll.width - st::emojiPanHeaderLeft)
-, _addText(lang(lng_stickers_featured_add).toUpper())
+, _megagroupSetAbout(st::columnMinimalWidthThird - st::emojiScroll.width - st::emojiPanHeaderLeft)
+, _addText(tr::lng_stickers_featured_add(tr::now).toUpper())
 , _addWidth(st::stickersTrendingAdd.font->width(_addText))
-, _settings(this, lang(lng_stickers_you_have)) {
-	resize(st::emojiPanWidth - st::emojiScroll.width - st::buttonRadius, countHeight());
-
+, _settings(this, tr::lng_stickers_you_have(tr::now))
+, _previewTimer([=] { showPreview(); })
+, _searchRequestTimer([=] { sendSearchRequest(); }) {
 	setMouseTracking(true);
 	setAttribute(Qt::WA_OpaquePaintEvent);
 
-	connect(_settings, SIGNAL(clicked()), this, SLOT(onSettings()));
-
-	_previewTimer.setSingleShot(true);
-	connect(&_previewTimer, SIGNAL(timeout()), this, SLOT(onPreview()));
-
-	subscribe(Auth().downloaderTaskFinished(), [this] {
-		update();
-		readVisibleSets();
+	_settings->addClickHandler([=] {
+		controller->show(
+			Box<StickersBox>(controller, StickersBox::Section::Installed));
 	});
-	subscribe(Notify::PeerUpdated(), Notify::PeerUpdatedHandler(Notify::PeerUpdate::Flag::ChannelStickersChanged, [this](const Notify::PeerUpdate &update) {
-		if (update.peer == _megagroupSet) {
-			refreshStickers();
+
+	session().downloaderTaskFinished(
+	) | rpl::start_with_next([=] {
+		if (isVisible()) {
+			update();
+			readVisibleFeatured(getVisibleTop(), getVisibleBottom());
 		}
-	}));
+	}, lifetime());
+
+	session().changes().peerUpdates(
+		Data::PeerUpdate::Flag::StickersSet
+	) | rpl::filter([=](const Data::PeerUpdate &update) {
+		return (update.peer.get() == _megagroupSet);
+	}) | rpl::start_with_next([=] {
+		refreshStickers();
+	}, lifetime());
+
+	session().data().stickers().recentUpdated(
+	) | rpl::start_with_next([=] {
+		refreshRecent();
+	}, lifetime());
+}
+
+Main::Session &StickersListWidget::session() const {
+	return controller()->session();
+}
+
+rpl::producer<TabbedSelector::FileChosen> StickersListWidget::chosen() const {
+	return _chosen.events();
+}
+
+rpl::producer<> StickersListWidget::scrollUpdated() const {
+	return _scrollUpdated.events();
+}
+
+rpl::producer<> StickersListWidget::checkForHide() const {
+	return _checkForHide.events();
 }
 
 object_ptr<TabbedSelector::InnerFooter> StickersListWidget::createFooter() {
 	Expects(_footer == nullptr);
+
 	auto result = object_ptr<Footer>(this);
 	_footer = result;
-	return std::move(result);
+	return result;
 }
 
-void StickersListWidget::setVisibleTopBottom(int visibleTop, int visibleBottom) {
-	auto top = getVisibleTop();
-	Inner::setVisibleTopBottom(visibleTop, visibleBottom);
+void StickersListWidget::visibleTopBottomUpdated(
+		int visibleTop,
+		int visibleBottom) {
+	Inner::visibleTopBottomUpdated(visibleTop, visibleBottom);
 	if (_section == Section::Featured) {
-		readVisibleSets();
+		checkVisibleFeatured(visibleTop, visibleBottom);
+	} else {
+		checkVisibleLottie();
 	}
 	validateSelectedIcon(ValidateIconAnimations::Full);
 }
 
-void StickersListWidget::readVisibleSets() {
-	auto itemsVisibleTop = getVisibleTop();
-	auto itemsVisibleBottom = getVisibleBottom();
-	auto rowHeight = featuredRowHeight();
-	int rowFrom = floorclamp(itemsVisibleTop, rowHeight, 0, _featuredSets.size());
-	int rowTo = ceilclamp(itemsVisibleBottom, rowHeight, 0, _featuredSets.size());
-	for (int i = rowFrom; i < rowTo; ++i) {
-		auto &set = _featuredSets[i];
+void StickersListWidget::checkVisibleFeatured(
+		int visibleTop,
+		int visibleBottom) {
+	readVisibleFeatured(visibleTop, visibleBottom);
+
+	const auto visibleHeight = visibleBottom - visibleTop;
+
+	if (visibleBottom > height() - visibleHeight * kPreloadOfficialPages) {
+		preloadMoreOfficial();
+	}
+
+	const auto rowHeight = featuredRowHeight();
+	const auto destroyAbove = floorclamp(visibleTop - visibleHeight, rowHeight, 0, _officialSets.size());
+	const auto destroyBelow = ceilclamp(visibleBottom + visibleHeight, rowHeight, 0, _officialSets.size());
+	for (auto i = 0; i != destroyAbove; ++i) {
+		clearHeavyIn(_officialSets[i]);
+	}
+	for (auto i = destroyBelow; i != _officialSets.size(); ++i) {
+		clearHeavyIn(_officialSets[i]);
+	}
+}
+
+void StickersListWidget::preloadMoreOfficial() {
+	if (_officialRequestId) {
+		return;
+	}
+	_officialRequestId = _api.request(MTPmessages_GetOldFeaturedStickers(
+		MTP_int(_officialOffset),
+		MTP_int(kOfficialLoadLimit),
+		MTP_int(0)
+	)).done([=](const MTPmessages_FeaturedStickers &result) {
+		_officialRequestId = 0;
+		result.match([&](const MTPDmessages_featuredStickersNotModified &d) {
+			LOG(("Api Error: messages.featuredStickersNotModified."));
+		}, [&](const MTPDmessages_featuredStickers &data) {
+			const auto &list = data.vsets().v;
+			_officialOffset += list.size();
+			for (int i = 0, l = list.size(); i != l; ++i) {
+				auto &data = list[i];
+				const auto setData = data.match([&](const auto &data) {
+					return data.vset().match([](const MTPDstickerSet &data) {
+						return &data;
+					});
+				});
+				const auto covers = data.match([](const MTPDstickerSetCovered &) {
+					return StickersPack();
+				}, [&](const MTPDstickerSetMultiCovered &data) {
+					auto result = StickersPack();
+					for (const auto &cover : data.vcovers().v) {
+						const auto document = session().data().processDocument(cover);
+						if (document->sticker()) {
+							result.push_back(document);
+						}
+					}
+					return result;
+				});
+				if (const auto set = session().data().stickers().feedSet(*setData)) {
+					if (!covers.empty()) {
+						set->covers = covers;
+					}
+					if (set->stickers.empty() && set->covers.empty()) {
+						continue;
+					}
+					const auto externalLayout = true;
+					appendSet(
+						_officialSets,
+						set->id,
+						externalLayout,
+						AppendSkip::Installed);
+				}
+			}
+		});
+		resizeToWidth(width());
+		update();
+	}).fail([=](const MTP::Error &error) {
+	}).send();
+}
+
+void StickersListWidget::readVisibleFeatured(
+		int visibleTop,
+		int visibleBottom) {
+	const auto rowHeight = featuredRowHeight();
+	const auto rowFrom = floorclamp(visibleTop, rowHeight, 0, _featuredSetsCount);
+	const auto rowTo = ceilclamp(visibleBottom, rowHeight, 0, _featuredSetsCount);
+	for (auto i = rowFrom; i < rowTo; ++i) {
+		auto &set = _officialSets[i];
 		if (!(set.flags & MTPDstickerSet_ClientFlag::f_unread)) {
 			continue;
 		}
-		if (i * rowHeight < itemsVisibleTop || (i + 1) * rowHeight > itemsVisibleBottom) {
+		if (i * rowHeight < visibleTop || (i + 1) * rowHeight > visibleBottom) {
 			continue;
 		}
-		int count = qMin(set.pack.size(), static_cast<int>(kStickersPanelPerRow));
+		int count = qMin(int(set.stickers.size()), _columnCount);
 		int loaded = 0;
 		for (int j = 0; j < count; ++j) {
-			if (set.pack[j]->thumb->loaded() || set.pack[j]->loaded()) {
+			if (!set.stickers[j].document->hasThumbnail()
+				|| !set.stickers[j].document->thumbnailLoading()
+				|| (set.stickers[j].documentMedia
+					&& set.stickers[j].documentMedia->loaded())) {
 				++loaded;
 			}
 		}
-		if (loaded == count) {
-			Stickers::MarkFeaturedAsRead(set.id);
+		if (count > 0 && loaded == count) {
+			session().api().readFeaturedSetDelayed(set.id);
 		}
 	}
 }
 
 int StickersListWidget::featuredRowHeight() const {
-	return st::stickersTrendingHeader + st::stickerPanSize.height() + st::stickersTrendingSkip;
+	return st::stickersTrendingHeader
+		+ _singleSize.height()
+		+ st::stickersTrendingSkip;
 }
 
 template <typename Callback>
 bool StickersListWidget::enumerateSections(Callback callback) const {
-	Expects(_section == Section::Stickers);
 	auto info = SectionInfo();
-	for (auto i = 0; i != _mySets.size(); ++i) {
-		auto &set = _mySets[i];
+	const auto &sets = shownSets();
+	for (auto i = 0; i != sets.size(); ++i) {
+		auto &set = sets[i];
 		info.section = i;
-		info.count = set.pack.size();
-		info.rowsTop = info.top + (setHasTitle(set) ? st::emojiPanHeader : st::stickerPanPadding);
-		if (set.id == Stickers::MegagroupSetId && !info.count) {
+		info.count = set.stickers.size();
+		const auto titleSkip = set.externalLayout
+			? st::stickersTrendingHeader
+			: setHasTitle(set)
+			? st::emojiPanHeader
+			: st::stickerPanPadding;
+		info.rowsTop = info.top + titleSkip;
+		if (set.externalLayout) {
+			info.rowsCount = 1;
+			info.rowsBottom = info.top + featuredRowHeight();
+		} else if (set.id == Data::Stickers::MegagroupSetId && !info.count) {
 			info.rowsCount = 0;
 			info.rowsBottom = info.rowsTop + _megagroupSetButtonRect.y() + _megagroupSetButtonRect.height() + st::stickerGroupCategoryAddMargin.bottom();
 		} else {
-			info.rowsCount = (info.count / kStickersPanelPerRow) + ((info.count % kStickersPanelPerRow) ? 1 : 0);
-			info.rowsBottom = info.rowsTop + info.rowsCount * st::stickerPanSize.height();
+			info.rowsCount = (info.count / _columnCount) + ((info.count % _columnCount) ? 1 : 0);
+			info.rowsBottom = info.rowsTop + info.rowsCount * _singleSize.height();
 		}
 		if (!callback(info)) {
 			return false;
@@ -533,7 +1118,8 @@ bool StickersListWidget::enumerateSections(Callback callback) const {
 }
 
 StickersListWidget::SectionInfo StickersListWidget::sectionInfo(int section) const {
-	Expects(section >= 0 && section < _mySets.size());
+	Expects(section >= 0 && section < shownSets().size());
+
 	auto result = SectionInfo();
 	enumerateSections([searchForSection = section, &result](const SectionInfo &info) {
 		if (info.section == searchForSection) {
@@ -548,7 +1134,7 @@ StickersListWidget::SectionInfo StickersListWidget::sectionInfo(int section) con
 StickersListWidget::SectionInfo StickersListWidget::sectionInfoByOffset(int yOffset) const {
 	auto result = SectionInfo();
 	enumerateSections([this, &result, yOffset](const SectionInfo &info) {
-		if (yOffset < info.rowsBottom || info.section == _mySets.size() - 1) {
+		if (yOffset < info.rowsBottom || info.section == shownSets().size() - 1) {
 			result = info;
 			return false;
 		}
@@ -557,22 +1143,39 @@ StickersListWidget::SectionInfo StickersListWidget::sectionInfoByOffset(int yOff
 	return result;
 }
 
-int StickersListWidget::countHeight() {
-	auto visibleHeight = getVisibleBottom() - getVisibleTop();
-	if (visibleHeight <= 0) {
-		visibleHeight = st::emojiPanMaxHeight - st::emojiCategory.height;
-	}
-	auto minimalLastHeight = (visibleHeight - st::stickerPanPadding);
-	auto countResult = [this, minimalLastHeight] {
-		if (_section == Section::Featured) {
-			return st::stickerPanPadding + shownSets().size() * featuredRowHeight();
-		} else if (!shownSets().empty()) {
-			auto info = sectionInfo(shownSets().size() - 1);
-			return info.top + qMax(info.rowsBottom - info.top, minimalLastHeight);
-		}
+int StickersListWidget::countDesiredHeight(int newWidth) {
+	if (newWidth <= st::stickerPanWidthMin) {
 		return 0;
+	}
+	auto availableWidth = newWidth - (st::stickerPanPadding - st::roundRadiusSmall);
+	auto columnCount = availableWidth / st::stickerPanWidthMin;
+	auto singleWidth = availableWidth / columnCount;
+	auto fullWidth = (st::roundRadiusSmall + newWidth + st::emojiScroll.width);
+	auto rowsRight = (fullWidth - columnCount * singleWidth) / 2;
+	accumulate_max(rowsRight, st::emojiScroll.width);
+	_rowsLeft = fullWidth
+		- columnCount * singleWidth
+		- rowsRight
+		- st::roundRadiusSmall;
+	_singleSize = QSize(singleWidth, singleWidth);
+	setColumnCount(columnCount);
+
+	auto visibleHeight = minimalHeight();
+	auto minimalHeight = (visibleHeight - st::stickerPanPadding);
+	auto countResult = [this](int minimalLastHeight) {
+		const auto &sets = shownSets();
+		if (sets.empty()) {
+			return 0;
+		}
+		const auto info = sectionInfo(sets.size() - 1);
+		return info.top
+			+ qMax(info.rowsBottom - info.top, minimalLastHeight);
 	};
-	return qMax(minimalLastHeight, countResult()) + st::stickerPanPadding;
+	const auto minimalLastHeight = (_section == Section::Stickers)
+		? minimalHeight
+		: 0;
+	return qMax(minimalHeight, countResult(minimalLastHeight))
+		+ st::stickerPanPadding;
 }
 
 void StickersListWidget::installedLocally(uint64 setId) {
@@ -590,26 +1193,325 @@ void StickersListWidget::clearInstalledLocally() {
 	}
 }
 
+void StickersListWidget::sendSearchRequest() {
+	if (_searchRequestId || _searchNextQuery.isEmpty()) {
+		return;
+	}
+
+	_searchRequestTimer.cancel();
+	_searchQuery = _searchNextQuery;
+
+	auto it = _searchCache.find(_searchQuery);
+	if (it != _searchCache.cend()) {
+		_footer->setLoading(false);
+		return;
+	}
+
+	_footer->setLoading(true);
+	const auto hash = int32(0);
+	_searchRequestId = _api.request(MTPmessages_SearchStickerSets(
+		MTP_flags(0),
+		MTP_string(_searchQuery),
+		MTP_int(hash)
+	)).done([=](const MTPmessages_FoundStickerSets &result) {
+		searchResultsDone(result);
+	}).fail([this](const MTP::Error &error) {
+		// show error?
+		_footer->setLoading(false);
+		_searchRequestId = 0;
+	}).handleAllErrors().send();
+}
+
+void StickersListWidget::searchForSets(const QString &query) {
+	const auto cleaned = query.trimmed();
+	if (cleaned.isEmpty()) {
+		cancelSetsSearch();
+		return;
+	}
+
+	if (_searchQuery != cleaned) {
+		_footer->setLoading(false);
+		if (const auto requestId = base::take(_searchRequestId)) {
+			_api.request(requestId).cancel();
+		}
+		if (_searchCache.find(cleaned) != _searchCache.cend()) {
+			_searchRequestTimer.cancel();
+			_searchQuery = _searchNextQuery = cleaned;
+		} else {
+			_searchNextQuery = cleaned;
+			_searchRequestTimer.callOnce(kSearchRequestDelay);
+		}
+		showSearchResults();
+	}
+}
+
+void StickersListWidget::cancelSetsSearch() {
+	_footer->setLoading(false);
+	if (const auto requestId = base::take(_searchRequestId)) {
+		_api.request(requestId).cancel();
+	}
+	_searchRequestTimer.cancel();
+	_searchQuery = _searchNextQuery = QString();
+	_searchCache.clear();
+	refreshSearchRows(nullptr);
+}
+
+void StickersListWidget::showSearchResults() {
+	refreshSearchRows();
+	scrollTo(0);
+}
+
+void StickersListWidget::refreshSearchRows() {
+	auto it = _searchCache.find(_searchQuery);
+	auto sets = (it != end(_searchCache))
+		? &it->second
+		: nullptr;
+	refreshSearchRows(sets);
+}
+
+void StickersListWidget::refreshSearchRows(
+		const std::vector<uint64> *cloudSets) {
+	clearSelection();
+
+	const auto wasSection = _section;
+	auto wasSets = base::take(_searchSets);
+	const auto guard = gsl::finally([&] {
+		if (_section == wasSection && _section == Section::Search) {
+			takeHeavyData(_searchSets, wasSets);
+		}
+	});
+
+	fillLocalSearchRows(_searchNextQuery);
+
+	if (!cloudSets && _searchNextQuery.isEmpty()) {
+		showStickerSet(!_mySets.empty()
+			? _mySets[0].id
+			: Data::Stickers::FeaturedSetId);
+		return;
+	}
+
+	setSection(Section::Search);
+	if (cloudSets) {
+		fillCloudSearchRows(*cloudSets);
+	}
+	if (_footer) {
+		_footer->refreshIcons(ValidateIconAnimations::Scroll);
+	}
+
+	_lastMousePosition = QCursor::pos();
+
+	resizeToWidth(width());
+	updateSelected();
+}
+
+void StickersListWidget::fillLocalSearchRows(const QString &query) {
+	const auto searchWordsList = TextUtilities::PrepareSearchWords(query);
+	if (searchWordsList.isEmpty()) {
+		return;
+	}
+	auto searchWordInTitle = [](
+			const QStringList &titleWords,
+			const QString &searchWord) {
+		for (const auto &titleWord : titleWords) {
+			if (titleWord.startsWith(searchWord)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	auto allSearchWordsInTitle = [&](
+			const QStringList &titleWords) {
+		for (const auto &searchWord : searchWordsList) {
+			if (!searchWordInTitle(titleWords, searchWord)) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	const auto &sets = session().data().stickers().sets();
+	for (const auto &[setId, titleWords] : _searchIndex) {
+		if (allSearchWordsInTitle(titleWords)) {
+			if (const auto it = sets.find(setId); it != sets.end()) {
+				addSearchRow(it->second.get());
+			}
+		}
+	}
+}
+
+void StickersListWidget::fillCloudSearchRows(
+		const std::vector<uint64> &cloudSets) {
+	const auto &sets = session().data().stickers().sets();
+	for (const auto setId : cloudSets) {
+		if (const auto it = sets.find(setId); it != sets.end()) {
+			addSearchRow(it->second.get());
+		}
+	}
+}
+
+void StickersListWidget::addSearchRow(not_null<StickersSet*> set) {
+	_searchSets.emplace_back(
+		set->id,
+		set,
+		set->flags,
+		set->title,
+		set->shortName,
+		set->count,
+		!SetInMyList(set->flags),
+		PrepareStickers(set->stickers.empty()
+			? set->covers
+			: set->stickers));
+}
+
+void StickersListWidget::takeHeavyData(
+		std::vector<Set> &to,
+		std::vector<Set> &from) {
+	auto indices = base::flat_map<uint64, int>();
+	indices.reserve(from.size());
+	auto index = 0;
+	for (const auto &set : from) {
+		indices.emplace(set.id, index++);
+	}
+	for (auto &toSet : to) {
+		const auto i = indices.find(toSet.id);
+		if (i != end(indices)) {
+			takeHeavyData(toSet, from[i->second]);
+		}
+	}
+}
+
+void StickersListWidget::takeHeavyData(Set &to, Set &from) {
+	to.lottiePlayer = std::move(from.lottiePlayer);
+	to.lottieLifetime = std::move(from.lottieLifetime);
+	auto &toList = to.stickers;
+	auto &fromList = from.stickers;
+	const auto same = ranges::equal(
+		toList,
+		fromList,
+		ranges::equal_to(),
+		&Sticker::document,
+		&Sticker::document);
+	if (same) {
+		for (auto i = 0, count = int(toList.size()); i != count; ++i) {
+			takeHeavyData(toList[i], fromList[i]);
+		}
+	} else {
+		auto indices = base::flat_map<not_null<DocumentData*>, int>();
+		indices.reserve(fromList.size());
+		auto index = 0;
+		for (const auto &fromSticker : fromList) {
+			indices.emplace(fromSticker.document, index++);
+		}
+		for (auto &toSticker : toList) {
+			const auto i = indices.find(toSticker.document);
+			if (i != end(indices)) {
+				takeHeavyData(toSticker, fromList[i->second]);
+			}
+		}
+		for (const auto &sticker : fromList) {
+			if (sticker.animated) {
+				to.lottiePlayer->remove(sticker.animated);
+			}
+		}
+	}
+}
+
+void StickersListWidget::takeHeavyData(Sticker &to, Sticker &from) {
+	to.documentMedia = std::move(from.documentMedia);
+	to.savedFrame = std::move(from.savedFrame);
+	to.animated = base::take(from.animated);
+}
+
+auto StickersListWidget::shownSets() const -> const std::vector<Set> & {
+	switch (_section) {
+	case Section::Featured: return _officialSets;
+	case Section::Search: return _searchSets;
+	case Section::Stickers: return _mySets;
+	}
+	Unexpected("Section in StickersListWidget.");
+}
+
+auto StickersListWidget::shownSets() -> std::vector<Set> & {
+	switch (_section) {
+	case Section::Featured: return _officialSets;
+	case Section::Search: return _searchSets;
+	case Section::Stickers: return _mySets;
+	}
+	Unexpected("Section in StickersListWidget.");
+}
+
+void StickersListWidget::searchResultsDone(
+		const MTPmessages_FoundStickerSets &result) {
+	_footer->setLoading(false);
+	_searchRequestId = 0;
+
+	if (result.type() == mtpc_messages_foundStickerSetsNotModified) {
+		LOG(("API Error: "
+			"messages.foundStickerSetsNotModified not expected."));
+		return;
+	}
+
+	Assert(result.type() == mtpc_messages_foundStickerSets);
+
+	auto it = _searchCache.find(_searchQuery);
+	if (it == _searchCache.cend()) {
+		it = _searchCache.emplace(
+			_searchQuery,
+			std::vector<uint64>()).first;
+	}
+	auto &d = result.c_messages_foundStickerSets();
+	for (const auto &stickerSet : d.vsets().v) {
+		const MTPDstickerSet *setData = nullptr;
+		StickersPack covers;
+		switch (stickerSet.type()) {
+		case mtpc_stickerSetCovered: {
+			auto &d = stickerSet.c_stickerSetCovered();
+			if (d.vset().type() == mtpc_stickerSet) {
+				setData = &d.vset().c_stickerSet();
+			}
+		} break;
+		case mtpc_stickerSetMultiCovered: {
+			auto &d = stickerSet.c_stickerSetMultiCovered();
+			if (d.vset().type() == mtpc_stickerSet) {
+				setData = &d.vset().c_stickerSet();
+			}
+			for (const auto &cover : d.vcovers().v) {
+				const auto document = session().data().processDocument(cover);
+				if (document->sticker()) {
+					covers.push_back(document);
+				}
+			}
+		} break;
+		}
+		if (!setData) continue;
+
+		if (const auto set = session().data().stickers().feedSet(*setData)) {
+			if (!covers.empty()) {
+				set->covers = covers;
+			}
+			if (set->stickers.empty() && set->covers.empty()) {
+				continue;
+			}
+			it->second.push_back(set->id);
+		}
+	}
+	showSearchResults();
+}
+
 int StickersListWidget::stickersLeft() const {
-	return (st::stickerPanPadding - st::buttonRadius);
+	return _rowsLeft;
 }
 
 QRect StickersListWidget::stickerRect(int section, int sel) {
-	int x = 0, y = 0;
-	if (_section == Section::Featured) {
-		x = stickersLeft() + (sel * st::stickerPanSize.width());
-		y = st::stickerPanPadding + (section * featuredRowHeight()) + st::stickersTrendingHeader;
-	} else if (_section == Section::Stickers) {
-		auto info = sectionInfo(section);
-		if (sel >= _mySets[section].pack.size()) {
-			sel -= _mySets[section].pack.size();
-		}
-		auto countTillItem = (sel - (sel % kStickersPanelPerRow));
-		auto rowsToSkip = (countTillItem / kStickersPanelPerRow) + ((countTillItem % kStickersPanelPerRow) ? 1 : 0);
-		x = stickersLeft() + ((sel % kStickersPanelPerRow) * st::stickerPanSize.width());
-		y = info.rowsTop + rowsToSkip * st::stickerPanSize.height();
+	auto info = sectionInfo(section);
+	if (sel >= shownSets()[section].stickers.size()) {
+		sel -= shownSets()[section].stickers.size();
 	}
-	return QRect(x, y, st::stickerPanSize.width(), st::stickerPanSize.height());
+	auto countTillItem = (sel - (sel % _columnCount));
+	auto rowsToSkip = (countTillItem / _columnCount) + ((countTillItem % _columnCount) ? 1 : 0);
+	auto x = stickersLeft() + ((sel % _columnCount) * _singleSize.width());
+	auto y = info.rowsTop + rowsToSkip * _singleSize.height();
+	return QRect(QPoint(x, y), _singleSize);
 }
 
 void StickersListWidget::paintEvent(QPaintEvent *e) {
@@ -617,133 +1519,118 @@ void StickersListWidget::paintEvent(QPaintEvent *e) {
 	auto clip = e->rect();
 	p.fillRect(clip, st::emojiPanBg);
 
-	if (_section == Section::Featured) {
-		paintFeaturedStickers(p, clip);
-	} else {
-		paintStickers(p, clip);
-	}
-}
-
-void StickersListWidget::paintFeaturedStickers(Painter &p, QRect clip) {
-	auto fromColumn = floorclamp(clip.x() - stickersLeft(), st::stickerPanSize.width(), 0, kStickersPanelPerRow);
-	auto toColumn = ceilclamp(clip.x() + clip.width() - stickersLeft(), st::stickerPanSize.width(), 0, kStickersPanelPerRow);
-	if (rtl()) {
-		qSwap(fromColumn, toColumn);
-		fromColumn = kStickersPanelPerRow - fromColumn;
-		toColumn = kStickersPanelPerRow - toColumn;
-	}
-
-	auto &sets = shownSets();
-	auto selectedSticker = base::get_if<OverSticker>(&_selected);
-	auto selectedButton = base::get_if<OverButton>(_pressed ? &_pressed : &_selected);
-
-	auto tilly = st::stickerPanPadding;
-	auto ms = getms();
-	for (auto c = 0, l = sets.size(); c != l; ++c) {
-		auto y = tilly;
-		auto &set = sets[c];
-		tilly = y + featuredRowHeight();
-		if (clip.top() >= tilly) continue;
-		if (y >= clip.y() + clip.height()) break;
-
-		auto size = int(set.pack.size());
-
-		auto widthForTitle = stickersRight() - (st::emojiPanHeaderLeft - st::buttonRadius);
-		if (featuredHasAddButton(c)) {
-			auto add = featuredAddRect(c);
-			auto selected = selectedButton ? (selectedButton->section == c) : false;
-			auto &textBg = selected ? st::stickersTrendingAdd.textBgOver : st::stickersTrendingAdd.textBg;
-
-			App::roundRect(p, myrtlrect(add), textBg, ImageRoundRadius::Small);
-			if (set.ripple) {
-				set.ripple->paint(p, add.x(), add.y(), width(), ms);
-				if (set.ripple->empty()) {
-					set.ripple.reset();
-				}
-			}
-			p.setFont(st::stickersTrendingAdd.font);
-			p.setPen(selected ? st::stickersTrendingAdd.textFgOver : st::stickersTrendingAdd.textFg);
-			p.drawTextLeft(add.x() - (st::stickersTrendingAdd.width / 2), add.y() + st::stickersTrendingAdd.textTop, width(), _addText, _addWidth);
-
-			widthForTitle -= add.width() - (st::stickersTrendingAdd.width / 2);
-		} else {
-			auto add = featuredAddRect(c);
-			int checkx = add.left() + (add.width() - st::stickersFeaturedInstalled.width()) / 2;
-			int checky = add.top() + (add.height() - st::stickersFeaturedInstalled.height()) / 2;
-			st::stickersFeaturedInstalled.paint(p, QPoint(checkx, checky), width());
-		}
-		if (set.flags & MTPDstickerSet_ClientFlag::f_unread) {
-			widthForTitle -= st::stickersFeaturedUnreadSize + st::stickersFeaturedUnreadSkip;
-		}
-
-		auto titleText = set.title;
-		auto titleWidth = st::stickersTrendingHeaderFont->width(titleText);
-		if (titleWidth > widthForTitle) {
-			titleText = st::stickersTrendingHeaderFont->elided(titleText, widthForTitle);
-			titleWidth = st::stickersTrendingHeaderFont->width(titleText);
-		}
-		p.setFont(st::stickersTrendingHeaderFont);
-		p.setPen(st::stickersTrendingHeaderFg);
-		p.drawTextLeft(st::emojiPanHeaderLeft - st::buttonRadius, y + st::stickersTrendingHeaderTop, width(), titleText, titleWidth);
-
-		if (set.flags & MTPDstickerSet_ClientFlag::f_unread) {
-			p.setPen(Qt::NoPen);
-			p.setBrush(st::stickersFeaturedUnreadBg);
-
-			{
-				PainterHighQualityEnabler hq(p);
-				p.drawEllipse(rtlrect(st::emojiPanHeaderLeft - st::buttonRadius + titleWidth + st::stickersFeaturedUnreadSkip, y + st::stickersTrendingHeaderTop + st::stickersFeaturedUnreadTop, st::stickersFeaturedUnreadSize, st::stickersFeaturedUnreadSize, width()));
-			}
-		}
-
-		auto statusText = (size > 0) ? lng_stickers_count(lt_count, size) : lang(lng_contacts_loading);
-		p.setFont(st::stickersTrendingSubheaderFont);
-		p.setPen(st::stickersTrendingSubheaderFg);
-		p.drawTextLeft(st::emojiPanHeaderLeft - st::buttonRadius, y + st::stickersTrendingSubheaderTop, width(), statusText);
-
-		y += st::stickersTrendingHeader;
-		if (y >= clip.y() + clip.height()) break;
-
-		for (int j = fromColumn; j < toColumn; ++j) {
-			int index = j;
-			if (index >= size) break;
-
-			auto selected = selectedSticker ? (selectedSticker->section == c && selectedSticker->index == index) : false;
-			auto deleteSelected = false;
-			paintSticker(p, set, y, index, selected, deleteSelected);
-		}
-	}
+	paintStickers(p, clip);
 }
 
 void StickersListWidget::paintStickers(Painter &p, QRect clip) {
-	auto fromColumn = floorclamp(clip.x() - stickersLeft(), st::stickerPanSize.width(), 0, kStickersPanelPerRow);
-	auto toColumn = ceilclamp(clip.x() + clip.width() - stickersLeft(), st::stickerPanSize.width(), 0, kStickersPanelPerRow);
+	auto fromColumn = floorclamp(clip.x() - stickersLeft(), _singleSize.width(), 0, _columnCount);
+	auto toColumn = ceilclamp(clip.x() + clip.width() - stickersLeft(), _singleSize.width(), 0, _columnCount);
 	if (rtl()) {
 		qSwap(fromColumn, toColumn);
-		fromColumn = kStickersPanelPerRow - fromColumn;
-		toColumn = kStickersPanelPerRow - toColumn;
+		fromColumn = _columnCount - fromColumn;
+		toColumn = _columnCount - toColumn;
 	}
 
-	auto ms = getms();
 	auto &sets = shownSets();
-	auto selectedSticker = base::get_if<OverSticker>(&_selected);
-	auto selectedButton = base::get_if<OverButton>(_pressed ? &_pressed : &_selected);
-	enumerateSections([this, &p, clip, fromColumn, toColumn, selectedSticker, selectedButton, ms](const SectionInfo &info) {
+	auto selectedSticker = std::get_if<OverSticker>(&_selected);
+	auto selectedButton = std::get_if<OverButton>(!v::is_null(_pressed)
+		? &_pressed
+		: &_selected);
+
+	if (sets.empty() && _section == Section::Search) {
+		paintEmptySearchResults(p);
+	}
+	enumerateSections([&](const SectionInfo &info) {
 		if (clip.top() >= info.rowsBottom) {
 			return true;
 		} else if (clip.top() + clip.height() <= info.top) {
 			return false;
 		}
-		auto &set = _mySets[info.section];
+		auto &set = sets[info.section];
+		if (set.externalLayout) {
+			const auto loadedCount = int(set.stickers.size());
+			const auto count = (set.flags
+				& MTPDstickerSet_ClientFlag::f_not_loaded)
+				? set.count
+				: loadedCount;
+
+			auto widthForTitle = stickersRight() - (st::emojiPanHeaderLeft - st::roundRadiusSmall);
+			if (featuredHasAddButton(info.section)) {
+				auto add = featuredAddRect(info.section);
+				auto selected = selectedButton ? (selectedButton->section == info.section) : false;
+				auto &textBg = selected ? st::stickersTrendingAdd.textBgOver : st::stickersTrendingAdd.textBg;
+
+				Ui::FillRoundRect(p, myrtlrect(add), textBg, ImageRoundRadius::Small);
+				if (set.ripple) {
+					set.ripple->paint(p, add.x(), add.y(), width());
+					if (set.ripple->empty()) {
+						set.ripple.reset();
+					}
+				}
+				p.setFont(st::stickersTrendingAdd.font);
+				p.setPen(selected ? st::stickersTrendingAdd.textFgOver : st::stickersTrendingAdd.textFg);
+				p.drawTextLeft(add.x() - (st::stickersTrendingAdd.width / 2), add.y() + st::stickersTrendingAdd.textTop, width(), _addText, _addWidth);
+
+				widthForTitle -= add.width() - (st::stickersTrendingAdd.width / 2);
+			} else {
+				auto add = featuredAddRect(info.section);
+				int checkx = add.left() + (add.width() - st::stickersFeaturedInstalled.width()) / 2;
+				int checky = add.top() + (add.height() - st::stickersFeaturedInstalled.height()) / 2;
+				st::stickersFeaturedInstalled.paint(p, QPoint(checkx, checky), width());
+			}
+			if (set.flags & MTPDstickerSet_ClientFlag::f_unread) {
+				widthForTitle -= st::stickersFeaturedUnreadSize + st::stickersFeaturedUnreadSkip;
+			}
+
+			auto titleText = set.title;
+			auto titleWidth = st::stickersTrendingHeaderFont->width(titleText);
+			if (titleWidth > widthForTitle) {
+				titleText = st::stickersTrendingHeaderFont->elided(titleText, widthForTitle);
+				titleWidth = st::stickersTrendingHeaderFont->width(titleText);
+			}
+			p.setFont(st::stickersTrendingHeaderFont);
+			p.setPen(st::stickersTrendingHeaderFg);
+			p.drawTextLeft(st::emojiPanHeaderLeft - st::roundRadiusSmall, info.top + st::stickersTrendingHeaderTop, width(), titleText, titleWidth);
+
+			if (set.flags & MTPDstickerSet_ClientFlag::f_unread) {
+				p.setPen(Qt::NoPen);
+				p.setBrush(st::stickersFeaturedUnreadBg);
+
+				{
+					PainterHighQualityEnabler hq(p);
+					p.drawEllipse(style::rtlrect(st::emojiPanHeaderLeft - st::roundRadiusSmall + titleWidth + st::stickersFeaturedUnreadSkip, info.top + st::stickersTrendingHeaderTop + st::stickersFeaturedUnreadTop, st::stickersFeaturedUnreadSize, st::stickersFeaturedUnreadSize, width()));
+				}
+			}
+
+			auto statusText = (count > 0) ? tr::lng_stickers_count(tr::now, lt_count, count) : tr::lng_contacts_loading(tr::now);
+			p.setFont(st::stickersTrendingSubheaderFont);
+			p.setPen(st::stickersTrendingSubheaderFg);
+			p.drawTextLeft(st::emojiPanHeaderLeft - st::roundRadiusSmall, info.top + st::stickersTrendingSubheaderTop, width(), statusText);
+
+			if (info.rowsTop >= clip.y() + clip.height()) {
+				return true;
+			}
+
+			for (int j = fromColumn; j < toColumn; ++j) {
+				int index = j;
+				if (index >= loadedCount) break;
+
+				auto selected = selectedSticker ? (selectedSticker->section == info.section && selectedSticker->index == index) : false;
+				auto deleteSelected = false;
+				paintSticker(p, set, info.rowsTop, info.section, index, selected, deleteSelected);
+			}
+			markLottieFrameShown(set);
+			return true;
+		}
 		if (setHasTitle(set) && clip.top() < info.rowsTop) {
 			auto titleText = set.title;
 			auto titleWidth = st::stickersTrendingHeaderFont->width(titleText);
-			auto widthForTitle = stickersRight() - (st::emojiPanHeaderLeft - st::buttonRadius);
+			auto widthForTitle = stickersRight() - (st::emojiPanHeaderLeft - st::roundRadiusSmall);
 			if (hasRemoveButton(info.section)) {
 				auto remove = removeButtonRect(info.section);
 				auto selected = selectedButton ? (selectedButton->section == info.section) : false;
 				if (set.ripple) {
-					set.ripple->paint(p, remove.x() + st::stickerPanRemoveSet.rippleAreaPosition.x(), remove.y() + st::stickerPanRemoveSet.rippleAreaPosition.y(), width(), ms);
+					set.ripple->paint(p, remove.x() + st::stickerPanRemoveSet.rippleAreaPosition.x(), remove.y() + st::stickerPanRemoveSet.rippleAreaPosition.y(), width());
 					if (set.ripple->empty()) {
 						set.ripple.reset();
 					}
@@ -758,46 +1645,154 @@ void StickersListWidget::paintStickers(Painter &p, QRect clip) {
 			}
 			p.setFont(st::emojiPanHeaderFont);
 			p.setPen(st::emojiPanHeaderFg);
-			p.drawTextLeft(st::emojiPanHeaderLeft - st::buttonRadius, info.top + st::emojiPanHeaderTop, width(), titleText, titleWidth);
+			p.drawTextLeft(st::emojiPanHeaderLeft - st::roundRadiusSmall, info.top + st::emojiPanHeaderTop, width(), titleText, titleWidth);
 		}
-		if (clip.top() + clip.height() > info.rowsTop) {
-			if (set.id == Stickers::MegagroupSetId && set.pack.empty()) {
-				auto buttonSelected = (base::get_if<OverGroupAdd>(&_selected) != nullptr);
-				paintMegagroupEmptySet(p, info.rowsTop, buttonSelected, ms);
-			} else {
-				auto special = (set.flags & MTPDstickerSet::Flag::f_official) != 0;
-				auto fromRow = floorclamp(clip.y() - info.rowsTop, st::stickerPanSize.height(), 0, info.rowsCount);
-				auto toRow = ceilclamp(clip.y() + clip.height() - info.rowsTop, st::stickerPanSize.height(), 0, info.rowsCount);
-				for (int i = fromRow; i < toRow; ++i) {
-					for (int j = fromColumn; j < toColumn; ++j) {
-						int index = i * kStickersPanelPerRow + j;
-						if (index >= info.count) break;
+		if (clip.top() + clip.height() <= info.rowsTop) {
+			return true;
+		} else if (set.id == Data::Stickers::MegagroupSetId && set.stickers.empty()) {
+			auto buttonSelected = (std::get_if<OverGroupAdd>(&_selected) != nullptr);
+			paintMegagroupEmptySet(p, info.rowsTop, buttonSelected);
+			return true;
+		}
+		auto special = (set.flags & MTPDstickerSet::Flag::f_official) != 0;
+		auto fromRow = floorclamp(clip.y() - info.rowsTop, _singleSize.height(), 0, info.rowsCount);
+		auto toRow = ceilclamp(clip.y() + clip.height() - info.rowsTop, _singleSize.height(), 0, info.rowsCount);
+		for (int i = fromRow; i < toRow; ++i) {
+			for (int j = fromColumn; j < toColumn; ++j) {
+				int index = i * _columnCount + j;
+				if (index >= info.count) break;
 
-						auto selected = selectedSticker ? (selectedSticker->section == info.section && selectedSticker->index == index) : false;
-						auto deleteSelected = selected && selectedSticker->overDelete;
-						paintSticker(p, set, info.rowsTop, index, selected, deleteSelected);
-					}
-				}
+				auto selected = selectedSticker ? (selectedSticker->section == info.section && selectedSticker->index == index) : false;
+				auto deleteSelected = selected && selectedSticker->overDelete;
+				paintSticker(p, set, info.rowsTop, info.section, index, selected, deleteSelected);
 			}
+		}
+		markLottieFrameShown(set);
+		return true;
+	});
+}
+
+void StickersListWidget::markLottieFrameShown(Set &set) {
+	if (const auto player = set.lottiePlayer.get()) {
+		const auto paused = controller()->isGifPausedAtLeastFor(
+			Window::GifPauseReason::SavedGifs);
+		if (!paused) {
+			player->markFrameShown();
+		}
+	}
+}
+
+void StickersListWidget::checkVisibleLottie() {
+	if (shownSets().empty()) {
+		return;
+	}
+	const auto visibleTop = getVisibleTop();
+	const auto visibleBottom = getVisibleBottom();
+	const auto destroyAfterDistance = (visibleBottom - visibleTop) * 2;
+	const auto destroyAbove = visibleTop - destroyAfterDistance;
+	const auto destroyBelow = visibleBottom + destroyAfterDistance;
+	enumerateSections([&](const SectionInfo &info) {
+		if (destroyBelow <= info.rowsTop
+			|| destroyAbove >= info.rowsBottom) {
+			clearHeavyIn(shownSets()[info.section]);
+		} else if ((visibleTop > info.rowsTop && visibleTop < info.rowsBottom)
+			|| (visibleBottom > info.rowsTop
+				&& visibleBottom < info.rowsBottom)) {
+			pauseInvisibleLottieIn(info);
 		}
 		return true;
 	});
 }
 
-int StickersListWidget::megagroupSetInfoLeft() const {
-	return st::emojiPanHeaderLeft - st::buttonRadius;
+void StickersListWidget::clearHeavyIn(Set &set, bool clearSavedFrames) {
+	const auto player = base::take(set.lottiePlayer);
+	const auto lifetime = base::take(set.lottieLifetime);
+	for (auto &sticker : set.stickers) {
+		if (clearSavedFrames) {
+			sticker.savedFrame = QPixmap();
+		}
+		sticker.animated = nullptr;
+		sticker.documentMedia = nullptr;
+	}
 }
 
-void StickersListWidget::paintMegagroupEmptySet(Painter &p, int y, bool buttonSelected, TimeMs ms) {
+void StickersListWidget::pauseInvisibleLottieIn(const SectionInfo &info) {
+	auto &set = shownSets()[info.section];
+	const auto player = set.lottiePlayer.get();
+	if (!player) {
+		return;
+	}
+	const auto pauseInRows = [&](int fromRow, int tillRow) {
+		Expects(fromRow <= tillRow);
+
+		for (auto i = fromRow; i != tillRow; ++i) {
+			for (auto j = 0; j != _columnCount; ++j) {
+				const auto index = i * _columnCount + j;
+				if (index >= info.count) {
+					break;
+				}
+				if (const auto animated = set.stickers[index].animated) {
+					player->pause(animated);
+				}
+			}
+		}
+	};
+
+	const auto visibleTop = getVisibleTop();
+	const auto visibleBottom = getVisibleBottom();
+	if (visibleTop >= info.rowsTop + _singleSize.height()
+		&& visibleTop < info.rowsBottom) {
+		const auto pauseHeight = (visibleTop - info.rowsTop);
+		const auto pauseRows = std::min(
+			pauseHeight / _singleSize.height(),
+			info.rowsCount);
+		pauseInRows(0, pauseRows);
+	}
+	if (visibleBottom > info.rowsTop
+		&& visibleBottom + _singleSize.height() <= info.rowsBottom) {
+		const auto pauseHeight = (info.rowsBottom - visibleBottom);
+		const auto pauseRows = std::min(
+			pauseHeight / _singleSize.height(),
+			info.rowsCount);
+		pauseInRows(info.rowsCount - pauseRows, info.rowsCount);
+	}
+}
+
+void StickersListWidget::paintEmptySearchResults(Painter &p) {
+	const auto iconLeft = (width() - st::stickersEmpty.width()) / 2;
+	const auto iconTop = (height() / 3) - (st::stickersEmpty.height() / 2);
+	st::stickersEmpty.paint(p, iconLeft, iconTop, width());
+
+	const auto text = tr::lng_stickers_nothing_found(tr::now);
+	const auto textWidth = st::normalFont->width(text);
+	p.setFont(st::normalFont);
+	p.setPen(st::windowSubTextFg);
+	p.drawTextLeft(
+		(width() - textWidth) / 2,
+		iconTop + st::stickersEmpty.height() - st::normalFont->height,
+		width(),
+		text,
+		textWidth);
+}
+
+int StickersListWidget::megagroupSetInfoLeft() const {
+	return st::emojiPanHeaderLeft - st::roundRadiusSmall;
+}
+
+void StickersListWidget::paintMegagroupEmptySet(Painter &p, int y, bool buttonSelected) {
+	p.setPen(st::emojiPanHeaderFg);
+
 	auto infoLeft = megagroupSetInfoLeft();
 	_megagroupSetAbout.drawLeft(p, infoLeft, y, width() - infoLeft, width());
 
-	auto &textBg = buttonSelected ? st::stickerGroupCategoryAdd.textBgOver : st::stickerGroupCategoryAdd.textBg;
+	auto &textBg = buttonSelected
+		? st::stickerGroupCategoryAdd.textBgOver
+		: st::stickerGroupCategoryAdd.textBg;
 
 	auto button = _megagroupSetButtonRect.translated(0, y);
-	App::roundRect(p, myrtlrect(button), textBg, ImageRoundRadius::Small);
+	Ui::FillRoundRect(p, myrtlrect(button), textBg, ImageRoundRadius::Small);
 	if (_megagroupSetButtonRipple) {
-		_megagroupSetButtonRipple->paint(p, button.x(), button.y(), width(), ms);
+		_megagroupSetButtonRipple->paint(p, button.x(), button.y(), width());
 		if (_megagroupSetButtonRipple->empty()) {
 			_megagroupSetButtonRipple.reset();
 		}
@@ -807,39 +1802,127 @@ void StickersListWidget::paintMegagroupEmptySet(Painter &p, int y, bool buttonSe
 	p.drawTextLeft(button.x() - (st::stickerGroupCategoryAdd.width / 2), button.y() + st::stickerGroupCategoryAdd.textTop, width(), _megagroupSetButtonText, _megagroupSetButtonTextWidth);
 }
 
-void StickersListWidget::paintSticker(Painter &p, Set &set, int y, int index, bool selected, bool deleteSelected) {
-	auto sticker = set.pack[index];
-	if (!sticker->sticker()) return;
+void StickersListWidget::ensureLottiePlayer(Set &set) {
+	if (set.lottiePlayer) {
+		return;
+	}
+	set.lottiePlayer = std::make_unique<Lottie::MultiPlayer>(
+		Lottie::Quality::Default,
+		getLottieRenderer());
+	const auto raw = set.lottiePlayer.get();
 
-	int row = (index / kStickersPanelPerRow), col = (index % kStickersPanelPerRow);
+	raw->updates(
+	) | rpl::start_with_next([=] {
+		const auto &sets = shownSets();
+		enumerateSections([&](const SectionInfo &info) {
+			if (shownSets()[info.section].lottiePlayer.get() == raw) {
+				update(
+					0,
+					info.rowsTop,
+					width(),
+					info.rowsBottom - info.rowsTop);
+				return false;
+			}
+			return true;
+		});
+	}, set.lottieLifetime);
+}
 
-	auto pos = QPoint(stickersLeft() + col * st::stickerPanSize.width(), y + row * st::stickerPanSize.height());
+void StickersListWidget::setupLottie(Set &set, int section, int index) {
+	auto &sticker = set.stickers[index];
+	const auto document = sticker.document;
+	ensureLottiePlayer(set);
+
+	// Document should be loaded already for the animation to be set up.
+	Assert(sticker.documentMedia != nullptr);
+	sticker.animated = LottieAnimationFromDocument(
+		set.lottiePlayer.get(),
+		sticker.documentMedia.get(),
+		StickerLottieSize::StickersPanel,
+		boundingBoxSize() * cIntRetinaFactor());
+}
+
+QSize StickersListWidget::boundingBoxSize() const {
+	return QSize(
+		_singleSize.width() - st::roundRadiusSmall * 2,
+		_singleSize.height() - st::roundRadiusSmall * 2);
+}
+
+void StickersListWidget::paintSticker(Painter &p, Set &set, int y, int section, int index, bool selected, bool deleteSelected) {
+	auto &sticker = set.stickers[index];
+	sticker.ensureMediaCreated();
+	const auto document = sticker.document;
+	const auto &media = sticker.documentMedia;
+	if (!document->sticker()) {
+		return;
+	}
+
+	const auto isAnimated = document->sticker()->animated;
+	if (isAnimated
+		&& !sticker.animated
+		&& media->loaded()) {
+		setupLottie(set, section, index);
+	}
+
+	int row = (index / _columnCount), col = (index % _columnCount);
+
+	auto pos = QPoint(stickersLeft() + col * _singleSize.width(), y + row * _singleSize.height());
 	if (selected) {
 		auto tl = pos;
-		if (rtl()) tl.setX(width() - tl.x() - st::stickerPanSize.width());
-		App::roundRect(p, QRect(tl, st::stickerPanSize), st::emojiPanHover, StickerHoverCorners);
+		if (rtl()) tl.setX(width() - tl.x() - _singleSize.width());
+		Ui::FillRoundRect(p, QRect(tl, _singleSize), st::emojiPanHover, Ui::StickerHoverCorners);
 	}
 
-	auto goodThumb = !sticker->thumb->isNull() && ((sticker->thumb->width() >= 128) || (sticker->thumb->height() >= 128));
-	if (goodThumb) {
-		sticker->thumb->load();
+	media->checkStickerSmall();
+
+	auto w = 1;
+	auto h = 1;
+	if (isAnimated && !document->dimensions.isEmpty()) {
+		const auto request = Lottie::FrameRequest{ boundingBoxSize() * cIntRetinaFactor() };
+		const auto size = request.size(document->dimensions, true) / cIntRetinaFactor();
+		w = std::max(size.width(), 1);
+		h = std::max(size.height(), 1);
 	} else {
-		sticker->checkSticker();
+		auto coef = qMin((_singleSize.width() - st::roundRadiusSmall * 2) / float64(document->dimensions.width()), (_singleSize.height() - st::roundRadiusSmall * 2) / float64(document->dimensions.height()));
+		if (coef > 1) coef = 1;
+		w = std::max(qRound(coef * document->dimensions.width()), 1);
+		h = std::max(qRound(coef * document->dimensions.height()), 1);
 	}
-
-	auto coef = qMin((st::stickerPanSize.width() - st::buttonRadius * 2) / float64(sticker->dimensions.width()), (st::stickerPanSize.height() - st::buttonRadius * 2) / float64(sticker->dimensions.height()));
-	if (coef > 1) coef = 1;
-	auto w = qMax(qRound(coef * sticker->dimensions.width()), 1);
-	auto h = qMax(qRound(coef * sticker->dimensions.height()), 1);
-	auto ppos = pos + QPoint((st::stickerPanSize.width() - w) / 2, (st::stickerPanSize.height() - h) / 2);
-	if (goodThumb) {
-		p.drawPixmapLeft(ppos, width(), sticker->thumb->pix(w, h));
-	} else if (!sticker->sticker()->img->isNull()) {
-		p.drawPixmapLeft(ppos, width(), sticker->sticker()->img->pix(w, h));
+	auto ppos = pos + QPoint((_singleSize.width() - w) / 2, (_singleSize.height() - h) / 2);
+	if (sticker.animated && sticker.animated->ready()) {
+		auto request = Lottie::FrameRequest();
+		request.box = boundingBoxSize() * cIntRetinaFactor();
+		const auto frame = sticker.animated->frame(request);
+		p.drawImage(
+			QRect(ppos, frame.size() / cIntRetinaFactor()),
+			frame);
+		if (sticker.savedFrame.isNull()) {
+			sticker.savedFrame = QPixmap::fromImage(frame, Qt::ColorOnly);
+			sticker.savedFrame.setDevicePixelRatio(cRetinaFactor());
+		}
+		set.lottiePlayer->unpause(sticker.animated);
+	} else {
+		const auto image = media->getStickerSmall();
+		const auto pixmap = !sticker.savedFrame.isNull()
+			? sticker.savedFrame
+			: image
+			? image->pixSingle(
+				w,
+				h,
+				w,
+				h,
+				ImageRoundRadius::None)
+			: QPixmap();
+		if (!pixmap.isNull()) {
+			p.drawPixmapLeft(ppos, width(), pixmap);
+			if (sticker.savedFrame.isNull()) {
+				sticker.savedFrame = pixmap;
+			}
+		}
 	}
 
 	if (selected && stickerHasDeleteButton(set, index)) {
-		auto xPos = pos + QPoint(st::stickerPanSize.width() - st::stickerPanDeleteIconBg.width(), 0);
+		auto xPos = pos + QPoint(_singleSize.width() - st::stickerPanDeleteIconBg.width(), 0);
 		p.setOpacity(deleteSelected ? st::stickerPanDeleteOpacityBgOver : st::stickerPanDeleteOpacityBg);
 		st::stickerPanDeleteIconBg.paint(p, xPos, width());
 		p.setOpacity(deleteSelected ? st::stickerPanDeleteOpacityFgOver : st::stickerPanDeleteOpacityFg);
@@ -849,40 +1932,45 @@ void StickersListWidget::paintSticker(Painter &p, Set &set, int y, int index, bo
 }
 
 int StickersListWidget::stickersRight() const {
-	return stickersLeft() + (kStickersPanelPerRow * st::stickerPanSize.width());
+	return stickersLeft() + (_columnCount * _singleSize.width());
 }
 
 bool StickersListWidget::featuredHasAddButton(int index) const {
-	if (index < 0 || index >= _featuredSets.size()) {
+	if (index < 0
+		|| index >= shownSets().size()
+		|| !shownSets()[index].externalLayout) {
 		return false;
 	}
-	auto flags = _featuredSets[index].flags;
-	return !(flags & MTPDstickerSet::Flag::f_installed) || (flags & MTPDstickerSet::Flag::f_archived);
+	const auto flags = shownSets()[index].flags;
+	return !SetInMyList(flags);
 }
 
 QRect StickersListWidget::featuredAddRect(int index) const {
 	auto addw = _addWidth - st::stickersTrendingAdd.width;
 	auto addh = st::stickersTrendingAdd.height;
 	auto addx = stickersRight() - addw;
-	auto addy = st::stickerPanPadding + index * featuredRowHeight() + st::stickersTrendingAddTop;
+	auto addy = sectionInfo(index).top + st::stickersTrendingAddTop;
 	return QRect(addx, addy, addw, addh);
 }
 
 bool StickersListWidget::hasRemoveButton(int index) const {
-	if (index < 0 || index >= _mySets.size()) {
+	if (index < 0 || index >= shownSets().size()) {
 		return false;
 	}
-	auto &set = _mySets[index];
+	auto &set = shownSets()[index];
+	if (set.externalLayout) {
+		return false;
+	}
 	auto flags = set.flags;
 	if (!(flags & MTPDstickerSet_ClientFlag::f_special)) {
 		return true;
 	}
-	if (set.id == Stickers::MegagroupSetId) {
+	if (set.id == Data::Stickers::MegagroupSetId) {
 		Assert(_megagroupSet != nullptr);
-		if (index + 1 != _mySets.size()) {
+		if (index + 1 != shownSets().size()) {
 			return true;
 		}
-		return !set.pack.empty() && _megagroupSet->canEditStickers();
+		return !set.stickers.empty() && _megagroupSet->canEditStickers();
 	}
 	return false;
 }
@@ -904,24 +1992,24 @@ void StickersListWidget::mousePressEvent(QMouseEvent *e) {
 
 	setPressed(_selected);
 	ClickHandler::pressed();
-	_previewTimer.start(QApplication::startDragTime());
+	_previewTimer.callOnce(QApplication::startDragTime());
 }
 
 void StickersListWidget::setPressed(OverState newPressed) {
-	if (auto button = base::get_if<OverButton>(&_pressed)) {
+	if (auto button = std::get_if<OverButton>(&_pressed)) {
 		auto &sets = shownSets();
 		Assert(button->section >= 0 && button->section < sets.size());
 		auto &set = sets[button->section];
 		if (set.ripple) {
 			set.ripple->lastStop();
 		}
-	} else if (base::get_if<OverGroupAdd>(&_pressed)) {
+	} else if (std::get_if<OverGroupAdd>(&_pressed)) {
 		if (_megagroupSetButtonRipple) {
 			_megagroupSetButtonRipple->lastStop();
 		}
 	}
 	_pressed = newPressed;
-	if (auto button = base::get_if<OverButton>(&_pressed)) {
+	if (auto button = std::get_if<OverButton>(&_pressed)) {
 		auto &sets = shownSets();
 		Assert(button->section >= 0 && button->section < sets.size());
 		auto &set = sets[button->section];
@@ -929,10 +2017,10 @@ void StickersListWidget::setPressed(OverState newPressed) {
 			set.ripple = createButtonRipple(button->section);
 		}
 		set.ripple->add(mapFromGlobal(QCursor::pos()) - buttonRippleTopLeft(button->section));
-	} else if (base::get_if<OverGroupAdd>(&_pressed)) {
+	} else if (std::get_if<OverGroupAdd>(&_pressed)) {
 		if (!_megagroupSetButtonRipple) {
 			auto maskSize = _megagroupSetButtonRect.size();
-			auto mask = Ui::RippleAnimation::roundRectMask(maskSize, st::buttonRadius);
+			auto mask = Ui::RippleAnimation::roundRectMask(maskSize, st::roundRadiusSmall);
 			_megagroupSetButtonRipple = std::make_unique<Ui::RippleAnimation>(st::stickerGroupCategoryAdd.ripple, std::move(mask), [this] {
 				rtlupdate(megagroupSetButtonRectFinal());
 			});
@@ -945,7 +2033,7 @@ QRect StickersListWidget::megagroupSetButtonRectFinal() const {
 	auto result = QRect();
 	if (_section == Section::Stickers) {
 		enumerateSections([this, &result](const SectionInfo &info) {
-			if (_mySets[info.section].id == Stickers::MegagroupSetId) {
+			if (shownSets()[info.section].id == Data::Stickers::MegagroupSetId) {
 				result = _megagroupSetButtonRect.translated(0, info.rowsTop);
 				return false;
 			}
@@ -955,33 +2043,98 @@ QRect StickersListWidget::megagroupSetButtonRectFinal() const {
 	return result;
 }
 
-QSharedPointer<Ui::RippleAnimation> StickersListWidget::createButtonRipple(int section) {
-	if (_section == Section::Featured) {
+std::unique_ptr<Ui::RippleAnimation> StickersListWidget::createButtonRipple(int section) {
+	Expects(section >= 0 && section < shownSets().size());
+
+	if (shownSets()[section].externalLayout) {
 		auto maskSize = QSize(_addWidth - st::stickersTrendingAdd.width, st::stickersTrendingAdd.height);
-		auto mask = Ui::RippleAnimation::roundRectMask(maskSize, st::buttonRadius);
-		return MakeShared<Ui::RippleAnimation>(st::stickersTrendingAdd.ripple, std::move(mask), [this, section] {
-			rtlupdate(featuredAddRect(section));
-		});
+		auto mask = Ui::RippleAnimation::roundRectMask(maskSize, st::roundRadiusSmall);
+		return std::make_unique<Ui::RippleAnimation>(
+			st::stickersTrendingAdd.ripple,
+			std::move(mask),
+			[this, section] { rtlupdate(featuredAddRect(section)); });
 	}
 	auto maskSize = QSize(st::stickerPanRemoveSet.rippleAreaSize, st::stickerPanRemoveSet.rippleAreaSize);
 	auto mask = Ui::RippleAnimation::ellipseMask(maskSize);
-	return MakeShared<Ui::RippleAnimation>(st::stickerPanRemoveSet.ripple, std::move(mask), [this, section] {
-		rtlupdate(removeButtonRect(section));
-	});
+	return std::make_unique<Ui::RippleAnimation>(
+		st::stickerPanRemoveSet.ripple,
+		std::move(mask),
+		[this, section] { rtlupdate(removeButtonRect(section)); });
 }
 
 QPoint StickersListWidget::buttonRippleTopLeft(int section) const {
-	if (_section == Section::Featured) {
+	Expects(section >= 0 && section < shownSets().size());
+
+	if (shownSets()[section].externalLayout) {
 		return myrtlrect(featuredAddRect(section)).topLeft();
 	}
 	return myrtlrect(removeButtonRect(section)).topLeft() + st::stickerPanRemoveSet.rippleAreaPosition;
 }
 
+void StickersListWidget::showStickerSetBox(not_null<DocumentData*> document) {
+	if (document->sticker()
+		&& document->sticker()->set.type() != mtpc_inputStickerSetEmpty) {
+		_displayingSet = true;
+		checkHideWithBox(StickerSetBox::Show(controller(), document));
+	}
+}
+
+void StickersListWidget::fillContextMenu(
+		not_null<Ui::PopupMenu*> menu,
+		SendMenu::Type type) {
+	auto selected = _selected;
+	auto &sets = shownSets();
+	if (v::is_null(selected) || !v::is_null(_pressed)) {
+		return;
+	}
+	if (auto sticker = std::get_if<OverSticker>(&selected)) {
+		Assert(sticker->section >= 0 && sticker->section < sets.size());
+		auto &set = sets[sticker->section];
+		Assert(sticker->index >= 0 && sticker->index < set.stickers.size());
+
+		const auto document = set.stickers[sticker->index].document;
+		const auto send = [=](Api::SendOptions options) {
+			_chosen.fire_copy({
+				.document = document,
+				.options = options });
+		};
+		SendMenu::FillSendMenu(
+			menu,
+			type,
+			SendMenu::DefaultSilentCallback(send),
+			SendMenu::DefaultScheduleCallback(this, type, send));
+
+		const auto toggleFavedSticker = [=] {
+			Api::ToggleFavedSticker(
+				document,
+				Data::FileOriginStickerSet(Data::Stickers::FavedSetId, 0));
+		};
+		menu->addAction(
+			(document->owner().stickers().isFaved(document)
+				? tr::lng_faved_stickers_remove
+				: tr::lng_faved_stickers_add)(tr::now),
+			toggleFavedSticker);
+
+		menu->addAction(tr::lng_context_pack_info(tr::now), [=] {
+			showStickerSetBox(document);
+		});
+
+		if (const auto id = set.id; id == Data::Stickers::RecentSetId) {
+			menu->addAction(tr::lng_recent_stickers_remove(tr::now), [=] {
+				Api::ToggleRecentSticker(
+					document,
+					Data::FileOriginStickerSet(id, 0),
+					false);
+			});
+		}
+	}
+}
+
 void StickersListWidget::mouseReleaseEvent(QMouseEvent *e) {
-	_previewTimer.stop();
+	_previewTimer.cancel();
 
 	auto pressed = _pressed;
-	setPressed(base::none);
+	setPressed(v::null);
 	if (pressed != _selected) {
 		update();
 	}
@@ -996,69 +2149,87 @@ void StickersListWidget::mouseReleaseEvent(QMouseEvent *e) {
 	updateSelected();
 
 	auto &sets = shownSets();
-	if (pressed && pressed == _selected) {
-		if (auto sticker = base::get_if<OverSticker>(&pressed)) {
+	if (!v::is_null(pressed) && pressed == _selected) {
+		if (auto sticker = std::get_if<OverSticker>(&pressed)) {
 			Assert(sticker->section >= 0 && sticker->section < sets.size());
 			auto &set = sets[sticker->section];
-			Assert(sticker->index >= 0 && sticker->index < set.pack.size());
+			Assert(sticker->index >= 0 && sticker->index < set.stickers.size());
 			if (stickerHasDeleteButton(set, sticker->index) && sticker->overDelete) {
-				if (set.id == Stickers::RecentSetId) {
+				if (set.id == Data::Stickers::RecentSetId) {
 					removeRecentSticker(sticker->section, sticker->index);
-				} else if (set.id == Stickers::FavedSetId) {
+				} else if (set.id == Data::Stickers::FavedSetId) {
 					removeFavedSticker(sticker->section, sticker->index);
 				} else {
 					Unexpected("Single sticker delete click.");
 				}
 				return;
 			}
-			emit selected(set.pack[sticker->index]);
-		} else if (auto set = base::get_if<OverSet>(&pressed)) {
+			const auto document = set.stickers[sticker->index].document;
+			if (e->modifiers() & Qt::ControlModifier) {
+				showStickerSetBox(document);
+			} else {
+				_chosen.fire_copy({ .document = document });
+			}
+		} else if (auto set = std::get_if<OverSet>(&pressed)) {
 			Assert(set->section >= 0 && set->section < sets.size());
 			displaySet(sets[set->section].id);
-		} else if (auto button = base::get_if<OverButton>(&pressed)) {
+		} else if (auto button = std::get_if<OverButton>(&pressed)) {
 			Assert(button->section >= 0 && button->section < sets.size());
-			if (_section == Section::Featured) {
+			if (sets[button->section].externalLayout) {
 				installSet(sets[button->section].id);
-			} else if (sets[button->section].id == Stickers::MegagroupSetId) {
-				auto removeLocally = sets[button->section].pack.empty()
+			} else if (sets[button->section].id == Data::Stickers::MegagroupSetId) {
+				auto removeLocally = sets[button->section].stickers.empty()
 					|| !_megagroupSet->canEditStickers();
 				removeMegagroupSet(removeLocally);
 			} else {
 				removeSet(sets[button->section].id);
 			}
-		} else if (base::get_if<OverGroupAdd>(&pressed)) {
-			Ui::show(Box<StickersBox>(_megagroupSet));
+		} else if (std::get_if<OverGroupAdd>(&pressed)) {
+			controller()->show(Box<StickersBox>(controller(), _megagroupSet));
 		}
 	}
 }
 
+void StickersListWidget::validateSelectedIcon(
+		ValidateIconAnimations animations) {
+	if (_footer) {
+		_footer->validateSelectedIcon(
+			currentSet(getVisibleTop()),
+			animations);
+	}
+}
+
 void StickersListWidget::removeRecentSticker(int section, int index) {
-	if (_section != Section::Stickers || section >= _mySets.size() || _mySets[section].id != Stickers::RecentSetId) {
+	if ((_section != Section::Stickers)
+		|| (section >= int(_mySets.size()))
+		|| (_mySets[section].id != Data::Stickers::RecentSetId)) {
 		return;
 	}
 
 	clearSelection();
 	bool refresh = false;
-	auto sticker = _mySets[section].pack[index];
-	auto &recent = cGetRecentStickers();
+	const auto &sticker = _mySets[section].stickers[index];
+	const auto document = sticker.document;
+	auto &recent = session().data().stickers().getRecentPack();
 	for (int32 i = 0, l = recent.size(); i < l; ++i) {
-		if (recent.at(i).first == sticker) {
+		if (recent.at(i).first == document) {
 			recent.removeAt(i);
-			Local::writeUserSettings();
+			session().saveSettings();
 			refresh = true;
 			break;
 		}
 	}
-	auto &sets = Global::RefStickerSets();
-	auto it = sets.find(Stickers::CustomSetId);
+	auto &sets = session().data().stickers().setsRef();
+	auto it = sets.find(Data::Stickers::CustomSetId);
 	if (it != sets.cend()) {
-		for (int i = 0, l = it->stickers.size(); i < l; ++i) {
-			if (it->stickers.at(i) == sticker) {
-				it->stickers.removeAt(i);
-				if (it->stickers.isEmpty()) {
+		const auto set = it->second.get();
+		for (int i = 0, l = set->stickers.size(); i < l; ++i) {
+			if (set->stickers.at(i) == document) {
+				set->stickers.removeAt(i);
+				if (set->stickers.isEmpty()) {
 					sets.erase(it);
 				}
-				Local::writeInstalledStickers();
+				session().local().writeInstalledStickers();
 				refresh = true;
 				break;
 			}
@@ -1072,15 +2243,29 @@ void StickersListWidget::removeRecentSticker(int section, int index) {
 }
 
 void StickersListWidget::removeFavedSticker(int section, int index) {
-	if (_section != Section::Stickers || section >= _mySets.size() || _mySets[section].id != Stickers::FavedSetId) {
+	if ((_section != Section::Stickers)
+		|| (section >= int(_mySets.size()))
+		|| (_mySets[section].id != Data::Stickers::FavedSetId)) {
 		return;
 	}
 
 	clearSelection();
-	auto sticker = _mySets[section].pack[index];
-	Stickers::SetFaved(sticker, false);
-	auto unfave = true;
-	MTP::send(MTPmessages_FaveSticker(sticker->mtpInput(), MTP_bool(unfave)));
+	const auto &sticker = _mySets[section].stickers[index];
+	const auto document = sticker.document;
+	session().data().stickers().setFaved(document, false);
+	Api::ToggleFavedSticker(
+		document,
+		Data::FileOriginStickerSet(Data::Stickers::FavedSetId, 0),
+		false);
+}
+
+void StickersListWidget::setColumnCount(int count) {
+	Expects(count > 0);
+
+	if (_columnCount != count) {
+		_columnCount = count;
+		refreshFooterIcons();
+	}
 }
 
 void StickersListWidget::mouseMoveEvent(QMouseEvent *e) {
@@ -1089,7 +2274,12 @@ void StickersListWidget::mouseMoveEvent(QMouseEvent *e) {
 }
 
 void StickersListWidget::resizeEvent(QResizeEvent *e) {
-	_settings->moveToLeft((st::emojiPanWidth - _settings->width()) / 2, height() / 3);
+	_settings->moveToLeft(
+		(width() - _settings->width()) / 2,
+		height() / 3);
+	if (!_megagroupSetAbout.isEmpty()) {
+		refreshMegagroupSetGeometry();
+	}
 }
 
 void StickersListWidget::leaveEventHook(QEvent *e) {
@@ -1106,8 +2296,8 @@ void StickersListWidget::enterFromChildEvent(QEvent *e, QWidget *child) {
 }
 
 void StickersListWidget::clearSelection() {
-	setPressed(base::none);
-	setSelected(base::none);
+	setPressed(v::null);
+	setSelected(v::null);
 	update();
 }
 
@@ -1117,82 +2307,152 @@ TabbedSelector::InnerFooter *StickersListWidget::getFooter() const {
 
 void StickersListWidget::processHideFinished() {
 	clearSelection();
+	clearHeavyData();
+	if (_footer) {
+		_footer->clearHeavyData();
+	}
 }
 
 void StickersListWidget::processPanelHideFinished() {
 	clearInstalledLocally();
-
+	clearHeavyData();
+	if (_footer) {
+		_footer->clearHeavyData();
+	}
 	// Preserve panel state through visibility toggles.
 	//// Reset to the recent stickers section.
 	//if (_section == Section::Featured && (!_footer || !_footer->hasOnlyFeaturedSets())) {
-	//	_section = Section::Stickers;
+	//	setSection(Section::Stickers);
 	//	validateSelectedIcon(ValidateIconAnimations::None);
 	//}
+}
+
+void StickersListWidget::setSection(Section section) {
+	if (_section == section) {
+		return;
+	}
+	clearHeavyData();
+	_section = section;
+}
+
+void StickersListWidget::clearHeavyData() {
+	for (auto &set : shownSets()) {
+		clearHeavyIn(set, false);
+	}
 }
 
 void StickersListWidget::refreshStickers() {
 	clearSelection();
 
-	_mySets.clear();
-	_favedStickersMap.clear();
-	_mySets.reserve(Global::StickerSetsOrder().size() + 3);
+	refreshMySets();
+	refreshFeaturedSets();
+	refreshSearchSets();
 
-	refreshFavedStickers();
-	refreshRecentStickers(false);
-	refreshMegagroupStickers(GroupStickersPlace::Visible);
-	for_const (auto setId, Global::StickerSetsOrder()) {
-		appendSet(_mySets, setId, AppendSkip::Archived);
-	}
-	refreshMegagroupStickers(GroupStickersPlace::Hidden);
-
-	_featuredSets.clear();
-	_featuredSets.reserve(Global::FeaturedStickerSetsOrder().size());
-
-	for_const (auto setId, Global::FeaturedStickerSetsOrder()) {
-		appendSet(_featuredSets, setId, AppendSkip::Installed);
-	}
-
-	auto newHeight = countHeight();
-	if (newHeight != height()) {
-		resize(width(), newHeight);
-	}
+	resizeToWidth(width());
 
 	if (_footer) {
-		_footer->refreshIcons(ValidateIconAnimations::None);
-		if (_footer->hasOnlyFeaturedSets() && _section != Section::Featured) {
-			showStickerSet(Stickers::FeaturedSetId);
-		}
+		refreshFooterIcons();
 	}
-
-	_settings->setVisible(_section == Section::Stickers && _mySets.isEmpty());
+	refreshSettingsVisibility();
 
 	_lastMousePosition = QCursor::pos();
 	updateSelected();
 	update();
 }
 
-void StickersListWidget::preloadImages() {
-	auto &sets = shownSets();
-	for (int i = 0, l = sets.size(), k = 0; i < l; ++i) {
-		int count = sets[i].pack.size();
-		if (_section == Section::Featured) {
-			accumulate_min(count, kStickersPanelPerRow);
+void StickersListWidget::refreshMySets() {
+	auto wasSets = base::take(_mySets);
+	_favedStickersMap.clear();
+	_mySets.reserve(session().data().stickers().setsOrder().size() + 3);
+
+	refreshFavedStickers();
+	refreshRecentStickers(false);
+	refreshMegagroupStickers(GroupStickersPlace::Visible);
+	for (const auto setId : session().data().stickers().setsOrder()) {
+		const auto externalLayout = false;
+		appendSet(_mySets, setId, externalLayout, AppendSkip::Archived);
+	}
+	refreshMegagroupStickers(GroupStickersPlace::Hidden);
+
+	takeHeavyData(_mySets, wasSets);
+}
+
+void StickersListWidget::refreshFeaturedSets() {
+	auto wasFeaturedSetsCount = base::take(_featuredSetsCount);
+	auto wereOfficial = base::take(_officialSets);
+	_officialSets.reserve(
+		session().data().stickers().featuredSetsOrder().size()
+		+ wereOfficial.size()
+		- wasFeaturedSetsCount);
+	for (const auto setId : session().data().stickers().featuredSetsOrder()) {
+		const auto externalLayout = true;
+		appendSet(_officialSets, setId, externalLayout, AppendSkip::Installed);
+	}
+	_featuredSetsCount = _officialSets.size();
+	if (wereOfficial.size() > wasFeaturedSetsCount) {
+		const auto &sets = session().data().stickers().sets();
+		const auto from = begin(wereOfficial) + wasFeaturedSetsCount;
+		const auto till = end(wereOfficial);
+		for (auto i = from; i != till; ++i) {
+			auto &set = *i;
+			auto it = sets.find(set.id);
+			if (it == sets.cend()
+				|| ((it->second->flags & MTPDstickerSet::Flag::f_installed_date)
+					&& !(it->second->flags & MTPDstickerSet::Flag::f_archived)
+					&& !_installedLocallySets.contains(set.id))) {
+				continue;
+			}
+			set.flags = it->second->flags;
+			_officialSets.push_back(std::move(set));
 		}
-		for (int j = 0; j != count; ++j) {
-			if (++k > kStickersPanelPerRow * (kStickersPanelPerRow + 1)) break;
+	}
+}
 
-			auto sticker = sets.at(i).pack.at(j);
-			if (!sticker || !sticker->sticker()) continue;
+void StickersListWidget::refreshSearchSets() {
+	refreshSearchIndex();
 
-			bool goodThumb = !sticker->thumb->isNull() && ((sticker->thumb->width() >= 128) || (sticker->thumb->height() >= 128));
-			if (goodThumb) {
-				sticker->thumb->load();
-			} else {
-				sticker->automaticLoad(0);
+	const auto &sets = session().data().stickers().sets();
+	for (auto &entry : _searchSets) {
+		if (const auto it = sets.find(entry.id); it != sets.end()) {
+			const auto set = it->second.get();
+			entry.flags = set->flags;
+			if (!set->stickers.empty()) {
+				entry.lottiePlayer = nullptr;
+				entry.stickers = PrepareStickers(set->stickers);
+			}
+			if (!SetInMyList(entry.flags)) {
+				_installedLocallySets.remove(entry.id);
+				entry.externalLayout = true;
 			}
 		}
-		if (k > kStickersPanelPerRow * (kStickersPanelPerRow + 1)) break;
 	}
+}
+
+void StickersListWidget::refreshSearchIndex() {
+	_searchIndex.clear();
+	for (const auto &set : _mySets) {
+		if (set.flags & MTPDstickerSet_ClientFlag::f_special) {
+			continue;
+		}
+		const auto string = set.title + ' ' + set.shortName;
+		const auto list = TextUtilities::PrepareSearchWords(string);
+		_searchIndex.emplace_back(set.id, list);
+	}
+}
+
+void StickersListWidget::refreshSettingsVisibility() {
+	const auto visible = (_section == Section::Stickers) && _mySets.empty();
+	_settings->setVisible(visible);
+}
+
+void StickersListWidget::refreshFooterIcons() {
+	_footer->refreshIcons(ValidateIconAnimations::None);
+	if (_footer->hasOnlyFeaturedSets() && _section != Section::Featured) {
+		showStickerSet(Data::Stickers::FeaturedSetId);
+	}
+}
+
+void StickersListWidget::preloadImages() {
 	if (_footer) {
 		_footer->preloadImages();
 	}
@@ -1200,23 +2460,49 @@ void StickersListWidget::preloadImages() {
 
 uint64 StickersListWidget::currentSet(int yOffset) const {
 	if (_section == Section::Featured) {
-		return Stickers::FeaturedSetId;
+		return Data::Stickers::FeaturedSetId;
 	}
-	return _mySets.isEmpty() ? Stickers::RecentSetId : _mySets[sectionInfoByOffset(yOffset).section].id;
+	const auto &sets = shownSets();
+	return sets.empty()
+		? Data::Stickers::RecentSetId
+		: sets[sectionInfoByOffset(yOffset).section].id;
 }
 
-void StickersListWidget::appendSet(Sets &to, uint64 setId, AppendSkip skip) {
-	auto &sets = Global::StickerSets();
-	auto it = sets.constFind(setId);
-	if (it == sets.cend() || it->stickers.isEmpty()) return;
-	if ((skip == AppendSkip::Archived) && (it->flags & MTPDstickerSet::Flag::f_archived)) return;
-	if ((skip == AppendSkip::Installed) && (it->flags & MTPDstickerSet::Flag::f_installed) && !(it->flags & MTPDstickerSet::Flag::f_archived)) {
+bool StickersListWidget::appendSet(
+		std::vector<Set> &to,
+		uint64 setId,
+		bool externalLayout,
+		AppendSkip skip) {
+	const auto &sets = session().data().stickers().sets();
+	auto it = sets.find(setId);
+	if (it == sets.cend()
+		|| (!externalLayout && it->second->stickers.isEmpty())) {
+		return false;
+	}
+	const auto set = it->second.get();
+	if ((skip == AppendSkip::Archived)
+		&& (set->flags & MTPDstickerSet::Flag::f_archived)) {
+		return false;
+	}
+	if ((skip == AppendSkip::Installed)
+		&& (set->flags & MTPDstickerSet::Flag::f_installed_date)
+		&& !(set->flags & MTPDstickerSet::Flag::f_archived)) {
 		if (!_installedLocallySets.contains(setId)) {
-			return;
+			return false;
 		}
 	}
-
-	to.push_back(Set(it->id, it->flags, it->title, it->stickers.size() + 1, it->stickers));
+	to.emplace_back(
+		set->id,
+		set,
+		set->flags,
+		set->title,
+		set->shortName,
+		set->count,
+		externalLayout,
+		PrepareStickers((set->stickers.empty() && externalLayout)
+			? set->covers
+			: set->stickers));
+	return true;
 }
 
 void StickersListWidget::refreshRecent() {
@@ -1224,82 +2510,127 @@ void StickersListWidget::refreshRecent() {
 		refreshRecentStickers();
 	}
 	if (_footer && _footer->hasOnlyFeaturedSets() && _section != Section::Featured) {
-		showStickerSet(Stickers::FeaturedSetId);
+		showStickerSet(Data::Stickers::FeaturedSetId);
 	}
 }
 
-void StickersListWidget::refreshRecentStickers(bool performResize) {
+auto StickersListWidget::collectRecentStickers() -> std::vector<Sticker> {
 	_custom.clear();
-	clearSelection();
-	auto &sets = Global::StickerSets();
-	auto &recent = cGetRecentStickers();
-	auto customIt = sets.constFind(Stickers::CustomSetId);
-	auto cloudIt = sets.constFind(Stickers::CloudRecentSetId);
+	auto result = std::vector<Sticker>();
 
-	StickerPack recentPack;
-	int customCnt = (customIt == sets.cend()) ? 0 : customIt->stickers.size();
-	int cloudCnt = (cloudIt == sets.cend()) ? 0 : cloudIt->stickers.size();
-	recentPack.reserve(cloudCnt + recent.size() + customCnt);
-	_custom.reserve(cloudCnt + recent.size() + customCnt);
-	if (cloudCnt > 0) {
-		for_const (auto sticker, cloudIt->stickers) {
-			if (!_favedStickersMap.contains(sticker)) {
-				recentPack.push_back(sticker);
-				_custom.push_back(false);
+	const auto &sets = session().data().stickers().sets();
+	const auto &recent = session().data().stickers().getRecentPack();
+	const auto customIt = sets.find(Data::Stickers::CustomSetId);
+	const auto cloudIt = sets.find(Data::Stickers::CloudRecentSetId);
+	const auto customCount = (customIt != sets.cend())
+		? customIt->second->stickers.size()
+		: 0;
+	const auto cloudCount = (cloudIt != sets.cend())
+		? cloudIt->second->stickers.size()
+		: 0;
+	result.reserve(cloudCount + recent.size() + customCount);
+	_custom.reserve(cloudCount + recent.size() + customCount);
+
+	auto add = [&](not_null<DocumentData*> document, bool custom) {
+		if (result.size() >= kRecentDisplayLimit) {
+			return;
+		}
+		const auto i = ranges::find(result, document, &Sticker::document);
+		if (i != end(result)) {
+			const auto index = (i - begin(result));
+			if (index >= cloudCount && custom) {
+				// Mark stickers from local recent as custom.
+				_custom[index] = true;
 			}
+		} else if (!_favedStickersMap.contains(document)) {
+			result.push_back(Sticker{
+				document
+			});
+			_custom.push_back(custom);
+		}
+	};
+
+	if (cloudCount > 0) {
+		for (const auto document : std::as_const(cloudIt->second->stickers)) {
+			add(document, false);
 		}
 	}
-	for_const (auto &recentSticker, recent) {
-		auto sticker = recentSticker.first;
-		if (!_favedStickersMap.contains(sticker)) {
-			recentPack.push_back(sticker);
-			_custom.push_back(false);
+	for (const auto &recentSticker : recent) {
+		add(recentSticker.first, false);
+	}
+	if (customCount > 0) {
+		for (const auto document : std::as_const(customIt->second->stickers)) {
+			add(document, true);
 		}
 	}
-	if (customCnt > 0) {
-		for_const (auto &sticker, customIt->stickers) {
-			auto index = recentPack.indexOf(sticker);
-			if (index >= cloudCnt) {
-				_custom[index] = true; // mark stickers from recent as custom
-			} else if (!_favedStickersMap.contains(sticker)) {
-				recentPack.push_back(sticker);
-				_custom.push_back(true);
-			}
-		}
-	}
+	return result;
+}
+
+void StickersListWidget::refreshRecentStickers(bool performResize) {
+	clearSelection();
+
+	auto recentPack = collectRecentStickers();
 	auto recentIt = std::find_if(_mySets.begin(), _mySets.end(), [](auto &set) {
-		return set.id == Stickers::RecentSetId;
+		return set.id == Data::Stickers::RecentSetId;
 	});
 	if (!recentPack.empty()) {
+		const auto shortName = QString();
+		const auto externalLayout = false;
+		auto set = Set(
+			Data::Stickers::RecentSetId,
+			nullptr,
+			(MTPDstickerSet::Flag::f_official
+				| MTPDstickerSet_ClientFlag::f_special),
+			tr::lng_recent_stickers(tr::now),
+			shortName,
+			recentPack.size(),
+			externalLayout,
+			std::move(recentPack));
 		if (recentIt == _mySets.end()) {
-			_mySets.push_back(Set(Stickers::RecentSetId, MTPDstickerSet::Flag::f_official | MTPDstickerSet_ClientFlag::f_special, lang(lng_recent_stickers), recentPack.size() * 2, recentPack));
+			const auto where = (_mySets.empty()
+				|| _mySets.begin()->id != Data::Stickers::FavedSetId)
+				? _mySets.begin()
+				: (_mySets.begin() + 1);
+			_mySets.insert(where, std::move(set));
 		} else {
-			recentIt->pack = recentPack;
+			std::swap(*recentIt, set);
+			takeHeavyData(*recentIt, set);
 		}
 	} else if (recentIt != _mySets.end()) {
 		_mySets.erase(recentIt);
 	}
 
 	if (performResize && (_section == Section::Stickers || _section == Section::Featured)) {
-		int32 h = countHeight();
-		if (h != height()) {
-			resize(width(), h);
-			update();
-		}
-
+		resizeToWidth(width());
 		updateSelected();
 	}
 }
 
 void StickersListWidget::refreshFavedStickers() {
 	clearSelection();
-	auto &sets = Global::StickerSets();
-	auto it = sets.constFind(Stickers::FavedSetId);
-	if (it == sets.cend() || it->stickers.isEmpty()) {
+	const auto &sets = session().data().stickers().sets();
+	const auto it = sets.find(Data::Stickers::FavedSetId);
+	if (it == sets.cend() || it->second->stickers.isEmpty()) {
 		return;
 	}
-	_mySets.push_back(Set(Stickers::FavedSetId, MTPDstickerSet::Flag::f_official | MTPDstickerSet_ClientFlag::f_special, lang(lng_faved_stickers), it->stickers.size() * 2, it->stickers));
-	_favedStickersMap = base::flat_set<not_null<DocumentData*>> { it->stickers.begin(), it->stickers.end() };
+	const auto set = it->second.get();
+	const auto externalLayout = false;
+	const auto shortName = QString();
+	_mySets.insert(_mySets.begin(), Set{
+		Data::Stickers::FavedSetId,
+		nullptr,
+		(MTPDstickerSet::Flag::f_official
+			| MTPDstickerSet_ClientFlag::f_special),
+		Lang::Hard::FavedSetTitle(),
+		shortName,
+		set->count,
+		externalLayout,
+		PrepareStickers(set->stickers)
+	});
+	_favedStickersMap = base::flat_set<not_null<DocumentData*>> {
+		set->stickers.begin(),
+		set->stickers.end()
+	};
 }
 
 void StickersListWidget::refreshMegagroupStickers(GroupStickersPlace place) {
@@ -1312,74 +2643,119 @@ void StickersListWidget::refreshMegagroupStickers(GroupStickersPlace place) {
 	};
 	if (_megagroupSet->mgInfo->stickerSet.type() == mtpc_inputStickerSetEmpty) {
 		if (canEdit) {
-			auto hidden = Auth().data().isGroupStickersSectionHidden(_megagroupSet->id);
+			auto hidden = session().settings().isGroupStickersSectionHidden(
+				_megagroupSet->id);
 			if (isShownHere(hidden)) {
-				_mySets.push_back(Set(Stickers::MegagroupSetId, MTPDstickerSet_ClientFlag::f_special | 0, lang(lng_group_stickers), 0));
+				const auto shortName = QString();
+				const auto externalLayout = false;
+				const auto count = 0;
+				_mySets.emplace_back(
+					Data::Stickers::MegagroupSetId,
+					nullptr,
+					MTPDstickerSet_ClientFlag::f_special | 0,
+					tr::lng_group_stickers(tr::now),
+					shortName,
+					count,
+					externalLayout);
 			}
 		}
 		return;
 	}
-	auto hidden = Auth().data().isGroupStickersSectionHidden(_megagroupSet->id);
+	auto hidden = session().settings().isGroupStickersSectionHidden(_megagroupSet->id);
 	auto removeHiddenForGroup = [this, &hidden] {
 		if (hidden) {
-			Auth().data().removeGroupStickersSectionHidden(_megagroupSet->id);
-			Local::writeUserSettings();
+			session().settings().removeGroupStickersSectionHidden(_megagroupSet->id);
+			session().saveSettings();
 			hidden = false;
 		}
 	};
 	if (canEdit && hidden) {
 		removeHiddenForGroup();
 	}
-	if (_megagroupSet->mgInfo->stickerSet.type() == mtpc_inputStickerSetID) {
-		auto &set = _megagroupSet->mgInfo->stickerSet.c_inputStickerSetID();
-		auto &sets = Global::StickerSets();
-		auto it = sets.constFind(set.vid.v);
-		if (it != sets.cend()) {
-			auto isInstalled = (it->flags & MTPDstickerSet::Flag::f_installed)
-				&& !(it->flags & MTPDstickerSet::Flag::f_archived);
-			if (isInstalled && !canEdit) {
-				removeHiddenForGroup();
-			} else if (isShownHere(hidden)) {
-				_mySets.push_back(Set(Stickers::MegagroupSetId, MTPDstickerSet_ClientFlag::f_special | 0, lang(lng_group_stickers), it->stickers.size() + 1, it->stickers));
-			}
-			return;
-		}
-	}
-	if (!isShownHere(hidden)) {
+	if (_megagroupSet->mgInfo->stickerSet.type() != mtpc_inputStickerSetID) {
 		return;
 	}
-	request(MTPmessages_GetStickerSet(_megagroupSet->mgInfo->stickerSet)).done([this](const MTPmessages_StickerSet &result) {
-		if (auto set = Stickers::FeedSetFull(result)) {
+	auto &set = _megagroupSet->mgInfo->stickerSet.c_inputStickerSetID();
+	const auto &sets = session().data().stickers().sets();
+	const auto it = sets.find(set.vid().v);
+	if (it != sets.cend()) {
+		const auto set = it->second.get();
+		auto isInstalled = (set->flags & MTPDstickerSet::Flag::f_installed_date)
+			&& !(set->flags & MTPDstickerSet::Flag::f_archived);
+		if (isInstalled && !canEdit) {
+			removeHiddenForGroup();
+		} else if (isShownHere(hidden)) {
+			const auto shortName = QString();
+			const auto externalLayout = false;
+			_mySets.emplace_back(
+				Data::Stickers::MegagroupSetId,
+				set,
+				MTPDstickerSet_ClientFlag::f_special | 0,
+				tr::lng_group_stickers(tr::now),
+				shortName,
+				set->count,
+				externalLayout,
+				PrepareStickers(set->stickers));
+		}
+		return;
+	} else if (!isShownHere(hidden)
+		|| _megagroupSetIdRequested == set.vid().v) {
+		return;
+	}
+	_megagroupSetIdRequested = set.vid().v;
+	_api.request(MTPmessages_GetStickerSet(
+		_megagroupSet->mgInfo->stickerSet
+	)).done([=](const MTPmessages_StickerSet &result) {
+		if (const auto set = session().data().stickers().feedSetFull(result)) {
 			refreshStickers();
+			if (set->id == _megagroupSetIdRequested) {
+				_megagroupSetIdRequested = 0;
+			} else {
+				LOG(("API Error: Got different set."));
+			}
 		}
 	}).send();
 }
 
-void StickersListWidget::fillIcons(QList<StickerIcon> &icons) {
-	icons.clear();
-	icons.reserve(_mySets.size() + 1);
-	if (Global::FeaturedStickerSetsUnreadCount() && !_featuredSets.isEmpty()) {
-		icons.push_back(StickerIcon(Stickers::FeaturedSetId));
+std::vector<StickerIcon> StickersListWidget::fillIcons() {
+	auto result = std::vector<StickerIcon>();
+	result.reserve(_mySets.size() + 1);
+	if (!_officialSets.empty()) {
+		result.emplace_back(Data::Stickers::FeaturedSetId);
 	}
 
 	auto i = 0;
-	if (i != _mySets.size() && _mySets[i].id == Stickers::FavedSetId) {
+	if (i != _mySets.size() && _mySets[i].id == Data::Stickers::FavedSetId) {
 		++i;
-		icons.push_back(StickerIcon(Stickers::FavedSetId));
+		result.emplace_back(Data::Stickers::FavedSetId);
 	}
-	if (i != _mySets.size() && _mySets[i].id == Stickers::RecentSetId) {
+	if (i != _mySets.size() && _mySets[i].id == Data::Stickers::RecentSetId) {
 		++i;
-		icons.push_back(StickerIcon(Stickers::RecentSetId));
+		if (result.empty() || result.back().setId != Data::Stickers::FavedSetId) {
+			result.emplace_back(Data::Stickers::RecentSetId);
+		}
 	}
 	for (auto l = _mySets.size(); i != l; ++i) {
-		if (_mySets[i].id == Stickers::MegagroupSetId) {
-			icons.push_back(StickerIcon(Stickers::MegagroupSetId));
-			icons.back().megagroup = _megagroupSet;
+		if (_mySets[i].id == Data::Stickers::MegagroupSetId) {
+			result.emplace_back(Data::Stickers::MegagroupSetId);
+			result.back().megagroup = _megagroupSet;
 			continue;
 		}
-		auto s = _mySets[i].pack[0];
-		auto availw = st::emojiCategory.width - 2 * st::stickerIconPadding, availh = st::emojiCategory.height - 2 * st::stickerIconPadding;
-		auto thumbw = s->thumb->width(), thumbh = s->thumb->height(), pixw = 1, pixh = 1;
+		const auto set = _mySets[i].set;
+		Assert(set != nullptr);
+		const auto s = _mySets[i].stickers[0].document;
+		const auto availw = st::stickerIconWidth - 2 * st::stickerIconPadding;
+		const auto availh = st::emojiFooterHeight - 2 * st::stickerIconPadding;
+		const auto size = set->hasThumbnail()
+			? QSize(
+				set->thumbnailLocation().width(),
+				set->thumbnailLocation().height())
+			: s->hasThumbnail()
+			? QSize(
+				s->thumbnailLocation().width(),
+				s->thumbnailLocation().height())
+			: QSize();
+		auto thumbw = size.width(), thumbh = size.height(), pixw = 1, pixh = 1;
 		if (availw * thumbh > availh * thumbw) {
 			pixh = availh;
 			pixw = (pixh * thumbw) / thumbh;
@@ -1389,24 +2765,21 @@ void StickersListWidget::fillIcons(QList<StickerIcon> &icons) {
 		}
 		if (pixw < 1) pixw = 1;
 		if (pixh < 1) pixh = 1;
-		icons.push_back(StickerIcon(_mySets[i].id, s, pixw, pixh));
+		result.emplace_back(set, s, pixw, pixh);
 	}
-
-	if (!Global::FeaturedStickerSetsUnreadCount() && !_featuredSets.isEmpty()) {
-		icons.push_back(StickerIcon(Stickers::FeaturedSetId));
-	}
+	return result;
 }
 
 bool StickersListWidget::preventAutoHide() {
-	return _removingSetId != 0 || _displayingSetId != 0;
+	return _removingSetId != 0 || _displayingSet != 0;
 }
 
 void StickersListWidget::updateSelected() {
-	if (_pressed && !_previewShown) {
+	if (!v::is_null(_pressed) && !_previewShown) {
 		return;
 	}
 
-	auto newSelected = OverState { base::none };
+	auto newSelected = OverState { v::null };
 	auto p = mapFromGlobal(_lastMousePosition);
 	if (!rect().contains(p)
 		|| p.y() < getVisibleTop() || p.y() >= getVisibleBottom()
@@ -1416,59 +2789,38 @@ void StickersListWidget::updateSelected() {
 	}
 	auto &sets = shownSets();
 	auto sx = (rtl() ? width() - p.x() : p.x()) - stickersLeft();
-	if (_section == Section::Featured) {
-		auto yOffset = p.y() - st::stickerPanPadding;
-		auto section = (yOffset >= 0) ? (yOffset / featuredRowHeight()) : -1;
-		if (section >= 0 && section < sets.size()) {
-			yOffset -= section * featuredRowHeight();
-
-			auto &set = sets[section];
-			if (yOffset < st::stickersTrendingHeader) {
-				if (featuredHasAddButton(section) && myrtlrect(featuredAddRect(section)).contains(p.x(), p.y())) {
-					newSelected = OverButton { section };
-				} else {
-					newSelected = OverSet { section };
-				}
-			} else if (yOffset >= st::stickersTrendingHeader  && yOffset < st::stickersTrendingHeader + st::stickerPanSize.height()) {
-				if (sx >= 0 && sx < kStickersPanelPerRow * st::stickerPanSize.width()) {
-					auto index = qFloor(sx / st::stickerPanSize.width());
-					if (index >= 0 && index < set.pack.size()) {
-						auto overDelete = false;
-						newSelected = OverSticker { section, index, overDelete };
-					}
-				}
-			}
-		}
-	} else if (!_mySets.empty()) {
+	if (!shownSets().empty()) {
 		auto info = sectionInfoByOffset(p.y());
 		auto section = info.section;
 		if (p.y() >= info.top && p.y() < info.rowsTop) {
 			if (hasRemoveButton(section) && myrtlrect(removeButtonRect(section)).contains(p.x(), p.y())) {
 				newSelected = OverButton { section };
+			} else if (featuredHasAddButton(section) && myrtlrect(featuredAddRect(section)).contains(p.x(), p.y())) {
+				newSelected = OverButton{ section };
 			} else if (!(sets[section].flags & MTPDstickerSet_ClientFlag::f_special)) {
 				newSelected = OverSet { section };
-			} else if (sets[section].id == Stickers::MegagroupSetId
-					&& (_megagroupSet->canEditStickers() || !sets[section].pack.empty())) {
+			} else if (sets[section].id == Data::Stickers::MegagroupSetId
+					&& (_megagroupSet->canEditStickers() || !sets[section].stickers.empty())) {
 				newSelected = OverSet { section };
 			}
 		} else if (p.y() >= info.rowsTop && p.y() < info.rowsBottom && sx >= 0) {
 			auto yOffset = p.y() - info.rowsTop;
 			auto &set = sets[section];
-			if (set.id == Stickers::MegagroupSetId && set.pack.empty()) {
+			if (set.id == Data::Stickers::MegagroupSetId && set.stickers.empty()) {
 				if (_megagroupSetButtonRect.contains(stickersLeft() + sx, yOffset)) {
 					newSelected = OverGroupAdd {};
 				}
 			} else {
 				auto special = ((set.flags & MTPDstickerSet::Flag::f_official) != 0);
-				auto rowIndex = qFloor(yOffset / st::stickerPanSize.height());
-				auto columnIndex = qFloor(sx / st::stickerPanSize.width());
-				auto index = rowIndex * kStickersPanelPerRow + columnIndex;
-				if (index >= 0 && index < set.pack.size()) {
+				auto rowIndex = qFloor(yOffset / _singleSize.height());
+				auto columnIndex = qFloor(sx / _singleSize.width());
+				auto index = rowIndex * _columnCount + columnIndex;
+				if (index >= 0 && index < set.stickers.size()) {
 					auto overDelete = false;
 					if (stickerHasDeleteButton(set, index)) {
-						auto inx = sx - (columnIndex * st::stickerPanSize.width());
-						auto iny = yOffset - (rowIndex * st::stickerPanSize.height());
-						if (inx >= st::stickerPanSize.width() - st::stickerPanDeleteIconBg.width() && iny < st::stickerPanDeleteIconBg.height()) {
+						auto inx = sx - (columnIndex * _singleSize.width());
+						auto iny = yOffset - (rowIndex * _singleSize.height());
+						if (inx >= _singleSize.width() - st::stickerPanDeleteIconBg.width() && iny < st::stickerPanDeleteIconBg.height()) {
 							overDelete = true;
 						}
 					}
@@ -1482,36 +2834,42 @@ void StickersListWidget::updateSelected() {
 }
 
 bool StickersListWidget::setHasTitle(const Set &set) const {
-	if (set.id == Stickers::FavedSetId) {
+	if (set.id == Data::Stickers::FavedSetId) {
 		return false;
-	} else if (set.id == Stickers::RecentSetId) {
-		return !_mySets.empty() && _mySets[0].id == Stickers::FavedSetId;
+	} else if (set.id == Data::Stickers::RecentSetId) {
+		return !_mySets.empty() && _mySets[0].id == Data::Stickers::FavedSetId;
 	}
 	return true;
 }
 
 bool StickersListWidget::stickerHasDeleteButton(const Set &set, int index) const {
-	if (set.id == Stickers::RecentSetId) {
+	if (set.id == Data::Stickers::RecentSetId) {
 		Assert(index >= 0 && index < _custom.size());
 		return _custom[index];
 	}
-	return (set.id == Stickers::FavedSetId);
+	return (set.id == Data::Stickers::FavedSetId);
 }
 
 void StickersListWidget::setSelected(OverState newSelected) {
 	if (_selected != newSelected) {
-		setCursor(newSelected ? style::cur_pointer : style::cur_default);
+		setCursor(!v::is_null(newSelected)
+			? style::cur_pointer
+			: style::cur_default);
 
 		auto &sets = shownSets();
-		auto updateSelected = [this, &sets]() {
-			if (auto sticker = base::get_if<OverSticker>(&_selected)) {
+		auto updateSelected = [&]() {
+			if (auto sticker = std::get_if<OverSticker>(&_selected)) {
 				rtlupdate(stickerRect(sticker->section, sticker->index));
-			} else if (auto button = base::get_if<OverButton>(&_selected)) {
-				if (_section == Section::Featured) {
+			} else if (auto button = std::get_if<OverButton>(&_selected)) {
+				if (button->section >= 0
+					&& button->section < sets.size()
+					&& sets[button->section].externalLayout) {
 					rtlupdate(featuredAddRect(button->section));
 				} else {
 					rtlupdate(removeButtonRect(button->section));
 				}
+			} else if (std::get_if<OverGroupAdd>(&_selected)) {
+				rtlupdate(megagroupSetButtonRectFinal());
 			}
 		};
 		updateSelected();
@@ -1519,67 +2877,80 @@ void StickersListWidget::setSelected(OverState newSelected) {
 		updateSelected();
 
 		if (_previewShown && _pressed != _selected) {
-			if (auto sticker = base::get_if<OverSticker>(&_selected)) {
+			if (const auto sticker = std::get_if<OverSticker>(&_selected)) {
 				_pressed = _selected;
 				Assert(sticker->section >= 0 && sticker->section < sets.size());
-				auto &set = sets[sticker->section];
-				Assert(sticker->index >= 0 && sticker->index < set.pack.size());
-				Ui::showMediaPreview(set.pack[sticker->index]);
+				const auto &set = sets[sticker->section];
+				Assert(sticker->index >= 0 && sticker->index < set.stickers.size());
+				const auto document = set.stickers[sticker->index].document;
+				controller()->widget()->showMediaPreview(
+					document->stickerSetOrigin(),
+					document);
 			}
 		}
 	}
 }
 
-void StickersListWidget::onSettings() {
-	Ui::show(Box<StickersBox>(StickersBox::Section::Installed));
-}
-
-void StickersListWidget::onPreview() {
-	if (auto sticker = base::get_if<OverSticker>(&_pressed)) {
-		auto &sets = shownSets();
+void StickersListWidget::showPreview() {
+	if (const auto sticker = std::get_if<OverSticker>(&_pressed)) {
+		const auto &sets = shownSets();
 		Assert(sticker->section >= 0 && sticker->section < sets.size());
-		auto &set = sets[sticker->section];
-		Assert(sticker->index >= 0 && sticker->index < set.pack.size());
-		Ui::showMediaPreview(set.pack[sticker->index]);
+		const auto &set = sets[sticker->section];
+		Assert(sticker->index >= 0 && sticker->index < set.stickers.size());
+		const auto document = set.stickers[sticker->index].document;
+		controller()->widget()->showMediaPreview(
+			document->stickerSetOrigin(),
+			document);
 		_previewShown = true;
 	}
+}
+
+auto StickersListWidget::getLottieRenderer()
+-> std::shared_ptr<Lottie::FrameRenderer> {
+	if (auto result = _lottieRenderer.lock()) {
+		return result;
+	}
+	auto result = Lottie::MakeFrameRenderer();
+	_lottieRenderer = result;
+	return result;
 }
 
 void StickersListWidget::showStickerSet(uint64 setId) {
 	clearSelection();
 
-	if (setId == Stickers::FeaturedSetId) {
+	if (setId == Data::Stickers::FeaturedSetId) {
 		if (_section != Section::Featured) {
-			_section = Section::Featured;
-
+			setSection(Section::Featured);
 			refreshRecentStickers(true);
+			refreshSettingsVisibility();
 			if (_footer) {
 				_footer->refreshIcons(ValidateIconAnimations::Scroll);
 			}
 			update();
 		}
 
-		emit scrollToY(0);
-		emit scrollUpdated();
+		scrollTo(0);
+		_scrollUpdated.fire({});
 		return;
 	}
 
 	auto needRefresh = (_section != Section::Stickers);
 	if (needRefresh) {
-		_section = Section::Stickers;
+		setSection(Section::Stickers);
 		refreshRecentStickers(true);
+		refreshSettingsVisibility();
 	}
 
 	auto y = 0;
 	enumerateSections([this, setId, &y](const SectionInfo &info) {
-		if (_mySets[info.section].id == setId) {
+		if (shownSets()[info.section].id == setId) {
 			y = info.top;
 			return false;
 		}
 		return true;
 	});
-	emit scrollToY(y);
-	emit scrollUpdated();
+	scrollTo(y);
+	_scrollUpdated.fire({});
 
 	if (needRefresh && _footer) {
 		_footer->refreshIcons(ValidateIconAnimations::Scroll);
@@ -1601,12 +2972,15 @@ void StickersListWidget::refreshMegagroupSetGeometry() {
 
 void StickersListWidget::showMegagroupSet(ChannelData *megagroup) {
 	Expects(!megagroup || megagroup->isMegagroup());
+
 	if (_megagroupSet != megagroup) {
 		_megagroupSet = megagroup;
 
 		if (_megagroupSetAbout.isEmpty()) {
-			_megagroupSetAbout.setText(st::stickerGroupCategoryAbout, lang(lng_group_stickers_description));
-			_megagroupSetButtonText = lang(lng_group_stickers_add).toUpper();
+			_megagroupSetAbout.setText(
+				st::stickerGroupCategoryAbout,
+				tr::lng_group_stickers_description(tr::now));
+			_megagroupSetButtonText = tr::lng_group_stickers_add(tr::now).toUpper();
 			refreshMegagroupSetGeometry();
 		}
 		_megagroupSetButtonRipple.reset();
@@ -1615,115 +2989,163 @@ void StickersListWidget::showMegagroupSet(ChannelData *megagroup) {
 	}
 }
 
+void StickersListWidget::afterShown() {
+	if (_footer) {
+		_footer->stealFocus();
+	}
+}
+
+void StickersListWidget::beforeHiding() {
+	if (_footer) {
+		_footer->returnFocus();
+	}
+}
+
 void StickersListWidget::displaySet(uint64 setId) {
-	if (setId == Stickers::MegagroupSetId) {
+	if (setId == Data::Stickers::MegagroupSetId) {
 		if (_megagroupSet->canEditStickers()) {
-			_displayingSetId = setId;
-			auto box = Ui::show(Box<StickersBox>(_megagroupSet));
-			connect(box, &QObject::destroyed, this, [this] {
-				_displayingSetId = 0;
-				emit checkForHide();
-			});
+			_displayingSet = true;
+			checkHideWithBox(controller()->show(
+				Box<StickersBox>(controller(), _megagroupSet),
+				Ui::LayerOption::KeepOther).data());
 			return;
 		} else if (_megagroupSet->mgInfo->stickerSet.type() == mtpc_inputStickerSetID) {
-			setId = _megagroupSet->mgInfo->stickerSet.c_inputStickerSetID().vid.v;
+			setId = _megagroupSet->mgInfo->stickerSet.c_inputStickerSetID().vid().v;
 		} else {
 			return;
 		}
 	}
-	auto &sets = Global::StickerSets();
-	auto it = sets.constFind(setId);
+	const auto &sets = session().data().stickers().sets();
+	auto it = sets.find(setId);
 	if (it != sets.cend()) {
-		_displayingSetId = setId;
-		auto box = Ui::show(Box<StickerSetBox>(Stickers::inputSetId(*it)), KeepOtherLayers);
-		connect(box, &QObject::destroyed, this, [this] {
-			_displayingSetId = 0;
-			emit checkForHide();
-		});
+		_displayingSet = true;
+		checkHideWithBox(controller()->show(
+			Box<StickerSetBox>(controller(), it->second->mtpInput()),
+			Ui::LayerOption::KeepOther).data());
 	}
 }
 
-void StickersListWidget::installSet(uint64 setId) {
-	auto &sets = Global::StickerSets();
-	auto it = sets.constFind(setId);
-	if (it != sets.cend()) {
-		request(MTPmessages_InstallStickerSet(Stickers::inputSetId(*it), MTP_bool(false))).done([this](const MTPmessages_StickerSetInstallResult &result) {
-			if (result.type() == mtpc_messages_stickerSetInstallResultArchive) {
-				Stickers::ApplyArchivedResult(result.c_messages_stickerSetInstallResultArchive());
-			}
-		}).fail([this, setId](const RPCError &error) {
-			notInstalledLocally(setId);
-			Stickers::UndoInstallLocally(setId);
-		}).send();
-
-		installedLocally(setId);
-		Stickers::InstallLocally(setId);
+void StickersListWidget::checkHideWithBox(QPointer<Ui::BoxContent> box) {
+	if (!box) {
+		return;
 	}
+	connect(box, &QObject::destroyed, this, [=] {
+		_displayingSet = false;
+		_checkForHide.fire({});
+	});
+}
+
+void StickersListWidget::installSet(uint64 setId) {
+	const auto &sets = session().data().stickers().sets();
+	const auto it = sets.find(setId);
+	if (it != sets.cend()) {
+		const auto set = it->second.get();
+		const auto input = set->mtpInput();
+		if ((set->flags & MTPDstickerSet_ClientFlag::f_not_loaded)
+			|| set->stickers.empty()) {
+			_api.request(MTPmessages_GetStickerSet(
+				input
+			)).done([=](const MTPmessages_StickerSet &result) {
+				session().data().stickers().feedSetFull(result);
+				sendInstallRequest(setId, input);
+			}).send();
+		} else {
+			sendInstallRequest(setId, input);
+		}
+	}
+}
+
+void StickersListWidget::sendInstallRequest(
+		uint64 setId,
+		const MTPInputStickerSet &input) {
+	_api.request(MTPmessages_InstallStickerSet(
+		input,
+		MTP_bool(false)
+	)).done([=](const MTPmessages_StickerSetInstallResult &result) {
+		if (result.type() == mtpc_messages_stickerSetInstallResultArchive) {
+			session().data().stickers().applyArchivedResult(
+				result.c_messages_stickerSetInstallResultArchive());
+		}
+	}).fail([=](const MTP::Error &error) {
+		notInstalledLocally(setId);
+		session().data().stickers().undoInstallLocally(setId);
+	}).send();
+
+	installedLocally(setId);
+	session().data().stickers().installLocally(setId);
 }
 
 void StickersListWidget::removeMegagroupSet(bool locally) {
 	if (locally) {
-		Auth().data().setGroupStickersSectionHidden(_megagroupSet->id);
-		Local::writeUserSettings();
+		session().settings().setGroupStickersSectionHidden(_megagroupSet->id);
+		session().saveSettings();
 		refreshStickers();
 		return;
 	}
-	_removingSetId = Stickers::MegagroupSetId;
-	Ui::show(Box<ConfirmBox>(lang(lng_stickers_remove_group_set), base::lambda_guarded(this, [this, group = _megagroupSet] {
+	_removingSetId = Data::Stickers::MegagroupSetId;
+	controller()->show(Box<ConfirmBox>(tr::lng_stickers_remove_group_set(tr::now), crl::guard(this, [this, group = _megagroupSet] {
 		Expects(group->mgInfo != nullptr);
+
 		if (group->mgInfo->stickerSet.type() != mtpc_inputStickerSetEmpty) {
-			Auth().api().setGroupStickerSet(group, MTP_inputStickerSetEmpty());
+			session().api().setGroupStickerSet(group, MTP_inputStickerSetEmpty());
 		}
 		Ui::hideLayer();
 		_removingSetId = 0;
-		emit checkForHide();
-	}), base::lambda_guarded(this, [this] {
+		_checkForHide.fire({});
+	}), crl::guard(this, [this] {
 		_removingSetId = 0;
-		emit checkForHide();
+		_checkForHide.fire({});
 	})));
 }
 
 void StickersListWidget::removeSet(uint64 setId) {
-	auto &sets = Global::StickerSets();
-	auto it = sets.constFind(setId);
+	const auto &sets = session().data().stickers().sets();
+	const auto it = sets.find(setId);
 	if (it != sets.cend()) {
-		_removingSetId = it->id;
-		auto text = lng_stickers_remove_pack(lt_sticker_pack, it->title);
-		Ui::show(Box<ConfirmBox>(text, lang(lng_box_remove), base::lambda_guarded(this, [this] {
+		const auto set = it->second.get();
+		_removingSetId = set->id;
+		auto text = tr::lng_stickers_remove_pack(tr::now, lt_sticker_pack, set->title);
+		controller()->show(Box<ConfirmBox>(text, tr::lng_stickers_remove_pack_confirm(tr::now), crl::guard(this, [=] {
 			Ui::hideLayer();
-			auto &sets = Global::RefStickerSets();
-			auto it = sets.find(_removingSetId);
+			const auto &sets = session().data().stickers().sets();
+			const auto it = sets.find(_removingSetId);
 			if (it != sets.cend()) {
-				if (it->id && it->access) {
-					request(MTPmessages_UninstallStickerSet(MTP_inputStickerSetID(MTP_long(it->id), MTP_long(it->access)))).send();
-				} else if (!it->shortName.isEmpty()) {
-					request(MTPmessages_UninstallStickerSet(MTP_inputStickerSetShortName(MTP_string(it->shortName)))).send();
+				const auto set = it->second.get();
+				if (set->id && set->access) {
+					_api.request(MTPmessages_UninstallStickerSet(MTP_inputStickerSetID(MTP_long(set->id), MTP_long(set->access)))).send();
+				} else if (!set->shortName.isEmpty()) {
+					_api.request(MTPmessages_UninstallStickerSet(MTP_inputStickerSetShortName(MTP_string(set->shortName)))).send();
 				}
 				auto writeRecent = false;
-				auto &recent = cGetRecentStickers();
+				auto &recent = session().data().stickers().getRecentPack();
 				for (auto i = recent.begin(); i != recent.cend();) {
-					if (it->stickers.indexOf(i->first) >= 0) {
+					if (set->stickers.indexOf(i->first) >= 0) {
 						i = recent.erase(i);
 						writeRecent = true;
 					} else {
 						++i;
 					}
 				}
-				it->flags &= ~MTPDstickerSet::Flag::f_installed;
-				if (!(it->flags & MTPDstickerSet_ClientFlag::f_featured) && !(it->flags & MTPDstickerSet_ClientFlag::f_special)) {
-					sets.erase(it);
-				}
-				int removeIndex = Global::StickerSetsOrder().indexOf(_removingSetId);
-				if (removeIndex >= 0) Global::RefStickerSetsOrder().removeAt(removeIndex);
+				set->flags &= ~MTPDstickerSet::Flag::f_installed_date;
+				set->installDate = TimeId(0);
+				//
+				// Set can be in search results.
+				//
+				//if (!(set->flags & MTPDstickerSet_ClientFlag::f_featured)
+				//	&& !(set->flags & MTPDstickerSet_ClientFlag::f_special)) {
+				//	sets.erase(it);
+				//}
+				int removeIndex = session().data().stickers().setsOrder().indexOf(_removingSetId);
+				if (removeIndex >= 0) session().data().stickers().setsOrderRef().removeAt(removeIndex);
 				refreshStickers();
-				Local::writeInstalledStickers();
-				if (writeRecent) Local::writeUserSettings();
+				session().local().writeInstalledStickers();
+				if (writeRecent) session().saveSettings();
 			}
 			_removingSetId = 0;
-			emit checkForHide();
-		}), base::lambda_guarded(this, [this] {
+			_checkForHide.fire({});
+		}), crl::guard(this, [=] {
 			_removingSetId = 0;
-			emit checkForHide();
+			_checkForHide.fire({});
 		})));
 	}
 }

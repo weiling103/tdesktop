@@ -1,22 +1,9 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
@@ -24,20 +11,17 @@ Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
 #include "platform/mac/specific_mac_p.h"
 #include "base/timer.h"
 
+#include <QtWidgets/QMenuBar>
+#include <QtCore/QTimer>
+
 namespace Platform {
 
 class MainWindow : public Window::MainWindow {
+	// The Q_OBJECT meta info is used for qobject_cast!
 	Q_OBJECT
 
 public:
-	MainWindow();
-
-	void psFirstShow();
-	void psInitSysMenu();
-	void psUpdateMargins();
-
-	void psRefreshTaskbarIcon() {
-	}
+	explicit MainWindow(not_null<Window::Controller*> controller);
 
 	bool psFilterNativeEvent(void *event);
 
@@ -49,11 +33,13 @@ public:
 
 	~MainWindow();
 
-	class Private;
+	void updateWindowIcon() override;
 
-public slots:
 	void psShowTrayMenu();
 
+	class Private;
+
+public Q_SLOTS:
 	void psMacUndo();
 	void psMacRedo();
 	void psMacCut();
@@ -61,29 +47,34 @@ public slots:
 	void psMacPaste();
 	void psMacDelete();
 	void psMacSelectAll();
+	void psMacEmojiAndSymbols();
+
+	void psMacBold();
+	void psMacItalic();
+	void psMacUnderline();
+	void psMacStrikeOut();
+	void psMacMonospace();
+	void psMacClearFormat();
 
 protected:
 	bool eventFilter(QObject *obj, QEvent *evt) override;
 
+	void handleActiveChangedHook() override;
 	void stateChangedHook(Qt::WindowState state) override;
 	void initHook() override;
-	void updateWindowIcon() override;
 	void titleVisibilityChangedHook() override;
 	void unreadCounterChangedHook() override;
 
-	QImage psTrayIcon(bool selected = false) const;
 	bool hasTrayIcon() const override {
 		return trayIcon;
 	}
 
 	void updateGlobalMenuHook() override;
 
-	void workmodeUpdated(DBIWorkMode mode) override;
+	void workmodeUpdated(Core::Settings::WorkMode mode) override;
 
 	QSystemTrayIcon *trayIcon = nullptr;
 	QMenu *trayIconMenu = nullptr;
-
-	QImage trayImg, trayImgSel;
 
 	void psTrayMenuUpdated();
 	void psSetupTrayIcon();
@@ -91,21 +82,26 @@ protected:
 
 	QTimer psUpdatedPositionTimer;
 
+	void initShadows() override;
 	void closeWithoutDestroy() override;
+	void createGlobalMenu() override;
 
 private:
+	friend class Private;
+
 	void hideAndDeactivate();
-	void createGlobalMenu();
 	void updateTitleCounter();
 	void updateIconCounters();
+	[[nodiscard]] QIcon generateIconForTray(int counter, bool muted) const;
 
-	friend class Private;
 	std::unique_ptr<Private> _private;
 
 	mutable bool psIdle;
 	mutable QTimer psIdleTimer;
 
 	base::Timer _hideAfterFullScreenTimer;
+
+	rpl::variable<bool> _canApplyMarkdown;
 
 	QMenuBar psMainMenu;
 	QAction *psLogout = nullptr;
@@ -121,6 +117,13 @@ private:
 	QAction *psNewGroup = nullptr;
 	QAction *psNewChannel = nullptr;
 	QAction *psShowTelegram = nullptr;
+
+	QAction *psBold = nullptr;
+	QAction *psItalic = nullptr;
+	QAction *psUnderline = nullptr;
+	QAction *psStrikeOut = nullptr;
+	QAction *psMonospace = nullptr;
+	QAction *psClearFormat = nullptr;
 
 	int _customTitleHeight = 0;
 

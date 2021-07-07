@@ -1,32 +1,21 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include <cstdio>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/sendfile.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <dirent.h>
 #include <pwd.h>
 #include <string>
 #include <deque>
+#include <vector>
 #include <cstring>
 #include <cerrno>
 #include <algorithm>
@@ -36,6 +25,7 @@ Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
 
 using std::string;
 using std::deque;
+using std::vector;
 using std::cout;
 
 bool do_mkdir(const char *path) { // from http://stackoverflow.com/questions/675039/how-can-i-create-directory-tree-in-c-linux
@@ -98,7 +88,7 @@ void writeLog(const char *format, ...) {
 	va_end(args);
 }
 
-bool copyFile(const char *from, const char *to) {
+bool copyFile(const char *from, const char *to, bool writeprotected) {
 	FILE *ffrom = fopen(from, "rb"), *fto = fopen(to, "wb");
 	if (!ffrom) {
 		if (fto) fclose(fto);
@@ -108,11 +98,6 @@ bool copyFile(const char *from, const char *to) {
 		fclose(ffrom);
 		return false;
 	}
-	static const int BufSize = 65536;
-	char buf[BufSize];
-	while (size_t size = fread(buf, 1, BufSize, ffrom)) {
-		fwrite(buf, 1, size, fto);
-	}
 
 	struct stat fst; // from http://stackoverflow.com/questions/5486774/keeping-fileowner-and-permissions-after-copying-file-in-c
 	//let's say this wont fail since you already worked OK on that fp
@@ -121,8 +106,35 @@ bool copyFile(const char *from, const char *to) {
 		fclose(fto);
 		return false;
 	}
+
+	ssize_t copied = sendfile(
+		fileno(fto),
+		fileno(ffrom),
+		nullptr,
+		fst.st_size);
+
+	if (copied == -1) {
+		writeLog(
+			"Copy by sendfile '%s' to '%s' failed, error: %d, fallback now.",
+			from,
+			to,
+			int(errno));
+		static const int BufSize = 65536;
+		char buf[BufSize];
+		while (size_t size = fread(buf, 1, BufSize, ffrom)) {
+			fwrite(buf, 1, size, fto);
+		}
+	} else {
+		writeLog(
+			"Copy by sendfile '%s' to '%s' done, size: %d, result: %d.",
+			from,
+			to,
+			int(fst.st_size),
+			int(copied));
+	}
+
 	//update to the same uid/gid
-	if (fchown(fileno(fto), fst.st_uid, fst.st_gid) != 0) {
+	if (!writeprotected && fchown(fileno(fto), fst.st_uid, fst.st_gid) != 0) {
 		fclose(ffrom);
 		fclose(fto);
 		return false;
@@ -221,7 +233,7 @@ void delFolder() {
 	rmdir(delFolder.c_str());
 }
 
-bool update() {
+bool update(bool writeprotected) {
 	writeLog("Update started..");
 
 	string updDir = workDir + "tupdates/temp", readyFilePath = workDir + "tupdates/temp/ready", tdataDir = workDir + "tupdates/temp/tdata";
@@ -309,10 +321,32 @@ bool update() {
 
 	for (size_t i = 0; i < from.size(); ++i) {
 		string fname = from[i], tofname = to[i];
+
+		// it is necessary to remove the old file to not to get an error if appimage file is used by fuse
+		struct stat statbuf;
+		writeLog("Trying to get stat() for '%s'", tofname.c_str());
+		if (!stat(tofname.c_str(), &statbuf)) {
+			if (S_ISDIR(statbuf.st_mode)) {
+				writeLog("Fully clearing path '%s'..", tofname.c_str());
+				if (!remove_directory(tofname.c_str())) {
+					writeLog("Error: failed to clear path '%s'", tofname.c_str());
+					delFolder();
+					return false;
+				}
+			} else {
+				writeLog("Unlinking file '%s'", tofname.c_str());
+				if (unlink(tofname.c_str())) {
+					writeLog("Error: failed to unlink '%s'", tofname.c_str());
+					delFolder();
+					return false;
+				}
+			}
+		}
+
 		writeLog("Copying file '%s' to '%s'..", fname.c_str(), tofname.c_str());
 		int copyTries = 0, triesLimit = 30;
 		do {
-			if (!copyFile(fname.c_str(), tofname.c_str())) {
+			if (!copyFile(fname.c_str(), tofname.c_str(), writeprotected)) {
 				++copyTries;
 				usleep(100000);
 			} else {
@@ -344,9 +378,18 @@ string CurrentExecutablePath(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-	bool needupdate = true, autostart = false, debug = false, tosettings = false, startintray = false, testmode = false;
+	bool needupdate = true;
+	bool autostart = false;
+	bool debug = false;
+	bool writeprotected = false;
+	bool tosettings = false;
+	bool startintray = false;
+	bool testmode = false;
+	bool externalupdater = false;
+	bool customWorkingDir = false;
 
-	char *key = 0, *crashreport = 0;
+	char *key = 0;
+	char *workdir = 0;
 	for (int i = 1; i < argc; ++i) {
 		if (equal(argv[i], "-noupdate")) {
 			needupdate = false;
@@ -358,14 +401,18 @@ int main(int argc, char *argv[]) {
 			startintray = true;
 		} else if (equal(argv[i], "-testmode")) {
 			testmode = true;
+		} else if (equal(argv[i], "-externalupdater")) {
+			externalupdater = true;
 		} else if (equal(argv[i], "-tosettings")) {
 			tosettings = true;
+		} else if (equal(argv[i], "-workdir_custom")) {
+			customWorkingDir = true;
+		} else if (equal(argv[i], "-writeprotected")) {
+			writeprotected = true;
 		} else if (equal(argv[i], "-key") && ++i < argc) {
 			key = argv[i];
 		} else if (equal(argv[i], "-workpath") && ++i < argc) {
-			workDir = argv[i];
-		} else if (equal(argv[i], "-crashreport") && ++i < argc) {
-			crashreport = argv[i];
+			workDir = workdir = argv[i];
 		} else if (equal(argv[i], "-exename") && ++i < argc) {
 			exeName = argv[i];
 		} else if (equal(argv[i], "-exepath") && ++i < argc) {
@@ -377,12 +424,13 @@ int main(int argc, char *argv[]) {
 	}
 	openLog();
 
-	writeLog("Updater started..");
+	writeLog("Updater started, new argments formatting..");
 	for (int i = 0; i < argc; ++i) {
 		writeLog("Argument: '%s'", argv[i]);
 	}
 	if (needupdate) writeLog("Need to update!");
 	if (autostart) writeLog("From autostart!");
+	if (writeprotected) writeLog("Write Protected folder!");
 
 	updaterName = CurrentExecutablePath(argc, argv);
 	writeLog("Updater binary full path is: %s", updaterName.c_str());
@@ -401,6 +449,8 @@ int main(int argc, char *argv[]) {
 			}
 			if (needupdate) {
 				if (workDir.empty()) { // old app launched, update prepared in tupdates/ready (not in tupdates/temp)
+					customWorkingDir = false;
+
 					writeLog("No workdir, trying to figure it out");
 					struct passwd *pw = getpwuid(getuid());
 					if (pw && pw->pw_dir && strlen(pw->pw_dir)) {
@@ -431,7 +481,7 @@ int main(int argc, char *argv[]) {
 				} else {
 					writeLog("Passed workpath is '%s'", workDir.c_str());
 				}
-				update();
+				update(writeprotected);
 			}
 		} else {
 			writeLog("Error: bad exe name!");
@@ -440,33 +490,48 @@ int main(int argc, char *argv[]) {
 		writeLog("Error: short exe name!");
 	}
 
-	static const int MaxLen = 65536, MaxArgsCount = 128;
+	auto fullBinaryPath = exePath + exeName;
+	const auto path = fullBinaryPath.c_str();
 
-	char path[MaxLen] = {0};
-	string fullBinaryPath = exePath + exeName;
-	strcpy(path, fullBinaryPath.c_str());
-
-	char *args[MaxArgsCount] = {0}, p_noupdate[] = "-noupdate", p_autostart[] = "-autostart", p_debug[] = "-debug", p_tosettings[] = "-tosettings", p_key[] = "-key", p_startintray[] = "-startintray", p_testmode[] = "-testmode";
-	int argIndex = 0;
-	args[argIndex++] = path;
-	if (crashreport) {
-		args[argIndex++] = crashreport;
-	} else {
-		args[argIndex++] = p_noupdate;
-		if (autostart) args[argIndex++] = p_autostart;
-		if (debug) args[argIndex++] = p_debug;
-		if (startintray) args[argIndex++] = p_startintray;
-		if (testmode) args[argIndex++] = p_testmode;
-		if (tosettings) args[argIndex++] = p_tosettings;
-		if (key) {
-			args[argIndex++] = p_key;
-			args[argIndex++] = key;
-		}
+	auto values = vector<string>();
+	const auto push = [&](string arg) {
+		// Force null-terminated .data() call result.
+		values.push_back(arg + char(0));
+	};
+	push(path);
+	push("-noupdate");
+	if (autostart) push("-autostart");
+	if (debug) push("-debug");
+	if (startintray) push("-startintray");
+	if (testmode) push("-testmode");
+	if (externalupdater) push("-externalupdater");
+	if (tosettings) push("-tosettings");
+	if (key) {
+		push("-key");
+		push(key);
 	}
-	pid_t pid = fork();
-	switch (pid) {
-	case -1: writeLog("fork() failed!"); return 1;
-	case 0: execv(path, args); return 1;
+	if (customWorkingDir && workdir) {
+		push("-workdir");
+		push(workdir);
+	}
+
+	auto args = vector<char*>();
+	for (auto &arg : values) {
+		args.push_back(arg.data());
+	}
+	args.push_back(nullptr);
+
+	// let the parent launch instead
+	if (!writeprotected) {
+		pid_t pid = fork();
+		switch (pid) {
+		case -1:
+			writeLog("fork() failed!");
+			return 1;
+		case 0:
+			execv(args[0], args.data());
+			return 1;
+		}
 	}
 
 	writeLog("Executed Telegram, closing log and quitting..");

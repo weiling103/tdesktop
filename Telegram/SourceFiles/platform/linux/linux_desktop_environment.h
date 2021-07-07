@@ -1,22 +1,9 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
@@ -26,18 +13,24 @@ namespace DesktopEnvironment {
 enum class Type {
 	Other,
 	Gnome,
+	Cinnamon,
 	KDE3,
 	KDE4,
 	KDE5,
 	Unity,
 	XFCE,
-	Pantheon,
+	MATE,
+	LXDE,
 };
 
 Type Get();
 
 inline bool IsGnome() {
 	return Get() == Type::Gnome;
+}
+
+inline bool IsCinnamon() {
+	return Get() == Type::Cinnamon;
 }
 
 inline bool IsKDE3() {
@@ -64,13 +57,22 @@ inline bool IsXFCE() {
 	return Get() == Type::XFCE;
 }
 
-inline bool IsPantheon() {
-	return Get() == Type::Pantheon;
+inline bool IsMATE() {
+	return Get() == Type::MATE;
 }
 
-bool TryQtTrayIcon();
-bool PreferAppIndicatorTrayIcon();
-bool TryUnityCounter();
+inline bool IsLXDE() {
+	return Get() == Type::LXDE;
+}
+
+inline bool IsGtkBased() {
+	return IsGnome()
+		|| IsCinnamon()
+		|| IsUnity()
+		|| IsMATE()
+		|| IsXFCE()
+		|| IsLXDE();
+}
 
 } // namespace DesktopEnvironment
 } // namespace Platform

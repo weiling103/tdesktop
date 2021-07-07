@@ -1,69 +1,112 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
 #include "base/timer.h"
+#include "base/object_ptr.h"
+#include "base/binary_guard.h"
+#include "ui/rp_widget.h"
+#include "ui/layers/layer_widget.h"
 
 namespace Ui {
 class IconButton;
 class FlatLabel;
+class UserpicButton;
+class PopupMenu;
+class ScrollArea;
+class VerticalLayout;
+class RippleButton;
+class PlainShadow;
+template <typename Widget>
+class SlideWrap;
+namespace Menu {
 class Menu;
+} // namespace Menu
 } // namespace Ui
 
-namespace Profile {
-class UserpicButton;
-} // namespace Profile
+namespace Main {
+class Account;
+} // namespace Main
 
 namespace Window {
 
-class MainMenu : public TWidget, private base::Subscriber {
-public:
-	MainMenu(QWidget *parent);
+class SessionController;
 
-	void setInnerFocus() {
-		setFocus();
-	}
-	void showFinished();
+class MainMenu : public Ui::LayerWidget, private base::Subscriber {
+public:
+	MainMenu(QWidget *parent, not_null<SessionController*> controller);
+
+	void parentResized() override;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
 
-private:
-	void checkSelf();
-	void updateControlsGeometry();
-	void updatePhone();
-	void refreshMenu();
+	void doSetInnerFocus() override {
+		setFocus();
+	}
 
-	object_ptr<Profile::UserpicButton> _userpicButton = { nullptr };
-	object_ptr<Ui::IconButton> _cloudButton = { nullptr };
-	object_ptr<Ui::Menu> _menu;
-	object_ptr<Ui::FlatLabel> _telegram;
-	object_ptr<Ui::FlatLabel> _version;
+private:
+	class AccountButton;
+	class ToggleAccountsButton;
+	class ResetScaleButton;
+
+	void setupArchiveButton();
+	void setupCloudButton();
+	void setupUserpicButton();
+	void setupAccounts();
+	void setupAccountsToggle();
+	[[nodiscard]] not_null<Ui::SlideWrap<Ui::RippleButton>*> setupAddAccount(
+		not_null<Ui::VerticalLayout*> container);
+	void rebuildAccounts();
+	void updateControlsGeometry();
+	void updateInnerControlsGeometry();
+	void updatePhone();
+	void initResetScaleButton();
+	void refreshMenu();
+	void refreshBackground();
+	void toggleAccounts();
+
+	const not_null<SessionController*> _controller;
+	object_ptr<Ui::UserpicButton> _userpicButton;
+	object_ptr<ToggleAccountsButton> _toggleAccounts;
+	object_ptr<Ui::IconButton> _archiveButton;
+	object_ptr<Ui::IconButton> _cloudButton;
+	object_ptr<ResetScaleButton> _resetScaleButton = { nullptr };
+	object_ptr<Ui::ScrollArea> _scroll;
+	not_null<Ui::VerticalLayout*> _inner;
+	base::flat_map<
+		not_null<Main::Account*>,
+		base::unique_qptr<AccountButton>> _watched;
+	not_null<Ui::SlideWrap<Ui::VerticalLayout>*> _accounts;
+	Ui::SlideWrap<Ui::RippleButton> *_addAccount = nullptr;
+	not_null<Ui::SlideWrap<Ui::PlainShadow>*> _shadow;
+	not_null<Ui::Menu::Menu*> _menu;
+	not_null<Ui::RpWidget*> _footer;
+	not_null<Ui::FlatLabel*> _telegram;
+	not_null<Ui::FlatLabel*> _version;
 	std::shared_ptr<QPointer<QAction>> _nightThemeAction;
 	base::Timer _nightThemeSwitch;
+	base::unique_qptr<Ui::PopupMenu> _contextMenu;
 
-	bool _showFinished = false;
+	base::binary_guard _accountSwitchGuard;
+
 	QString _phoneText;
+	QImage _background;
 
 };
+
+struct OthersUnreadState {
+	int count = 0;
+	bool allMuted = false;
+};
+
+[[nodiscard]] OthersUnreadState OtherAccountsUnreadStateCurrent();
+[[nodiscard]] rpl::producer<OthersUnreadState> OtherAccountsUnreadState();
 
 } // namespace Window

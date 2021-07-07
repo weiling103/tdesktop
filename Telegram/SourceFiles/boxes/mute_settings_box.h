@@ -1,9 +1,10 @@
-/* This file is part of Telegram Desktop, the official desktop version of
- * Telegram messaging app, see https://desktop.telegram.org
- *
- * This code is in Public Domain, see license terms in .github/CONTRIBUTING.md
- * Copyright (C) 2017, Nicholas Guriev <guriev-ns@ya.ru>
- */
+/*
+This file is part of Telegram Desktop,
+the official desktop application for the Telegram messaging service.
+
+This code is in Public Domain, see license terms in .github/CONTRIBUTING.md
+Copyright (C) 2017, Nicholas Guriev <guriev-ns@ya.ru>
+*/
 #pragma once
 
 #include "boxes/abstract_box.h"
@@ -11,18 +12,18 @@
 /* This class implements a dialog-box with radio-buttons for pick duration of
  * turning off notifications from a chat. The widget is opened by a context menu
  * in the left list of dialogues. */
-class MuteSettingsBox : public BoxContent {
-	Q_OBJECT
+class MuteSettingsBox : public Ui::BoxContent {
+public:
+	MuteSettingsBox(QWidget *parent, not_null<PeerData*> peer);
 
-  public:
-	MuteSettingsBox(QWidget *parent, not_null<PeerData*> peer)
-	  : _peer(peer) {
-	}
-
-  protected:
+protected:
 	void prepare() override;
 
-  private:
+	void keyPressEvent(QKeyEvent *e) override;
+
+private:
 	not_null<PeerData*> _peer;
+	Fn<void()> _save;
+
 };
 // vi: ts=4 tw=80

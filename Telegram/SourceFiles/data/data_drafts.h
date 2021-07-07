@@ -1,53 +1,129 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
 namespace Ui {
-class FlatTextarea;
+class InputField;
 } // namespace Ui
+
+namespace Main {
+class Session;
+} // namespace Main
 
 namespace Data {
 
-void applyPeerCloudDraft(PeerId peerId, const MTPDdraftMessage &draft);
-void clearPeerCloudDraft(PeerId peerId);
+void ApplyPeerCloudDraft(
+	not_null<Main::Session*> session,
+	PeerId peerId,
+	const MTPDdraftMessage &draft);
+void ClearPeerCloudDraft(
+	not_null<Main::Session*> session,
+	PeerId peerId,
+	TimeId date);
+
+enum class PreviewState : char {
+	Allowed,
+	Cancelled,
+	EmptyOnEdit,
+};
 
 struct Draft {
-	Draft() {
-	}
-	Draft(const TextWithTags &textWithTags, MsgId msgId, const MessageCursor &cursor, bool previewCancelled, mtpRequestId saveRequestId = 0)
-		: textWithTags(textWithTags)
-		, msgId(msgId)
-		, cursor(cursor)
-		, previewCancelled(previewCancelled)
-		, saveRequestId(saveRequestId) {
-	}
-	Draft(const Ui::FlatTextarea *field, MsgId msgId, bool previewCancelled, mtpRequestId saveRequestId = 0);
+	Draft() = default;
+	Draft(
+		const TextWithTags &textWithTags,
+		MsgId msgId,
+		const MessageCursor &cursor,
+		PreviewState previewState,
+		mtpRequestId saveRequestId = 0);
+	Draft(
+		not_null<const Ui::InputField*> field,
+		MsgId msgId,
+		PreviewState previewState,
+		mtpRequestId saveRequestId = 0);
 
-	QDateTime date;
+	TimeId date = 0;
 	TextWithTags textWithTags;
 	MsgId msgId = 0; // replyToId for message draft, editMsgId for edit draft
 	MessageCursor cursor;
-	bool previewCancelled = false;
+	PreviewState previewState = PreviewState::Allowed;
 	mtpRequestId saveRequestId = 0;
 };
+
+class DraftKey {
+public:
+	[[nodiscard]] static DraftKey None() {
+		return 0;
+	}
+	[[nodiscard]] static DraftKey Local() {
+		return kLocalDraftIndex;
+	}
+	[[nodiscard]] static DraftKey LocalEdit() {
+		return kLocalDraftIndex + kEditDraftShift;
+	}
+	[[nodiscard]] static DraftKey Cloud() {
+		return kCloudDraftIndex;
+	}
+	[[nodiscard]] static DraftKey Scheduled() {
+		return kScheduledDraftIndex;
+	}
+	[[nodiscard]] static DraftKey ScheduledEdit() {
+		return kScheduledDraftIndex + kEditDraftShift;
+	}
+	[[nodiscard]] static DraftKey Replies(MsgId rootId) {
+		return rootId;
+	}
+	[[nodiscard]] static DraftKey RepliesEdit(MsgId rootId) {
+		return rootId + kEditDraftShift;
+	}
+
+	[[nodiscard]] static DraftKey FromSerialized(int32 value) {
+		return value;
+	}
+	[[nodiscard]] int32 serialize() const {
+		return _value;
+	}
+
+	inline bool operator<(const DraftKey &other) const {
+		return _value < other._value;
+	}
+	inline bool operator==(const DraftKey &other) const {
+		return _value == other._value;
+	}
+	inline bool operator>(const DraftKey &other) const {
+		return (other < *this);
+	}
+	inline bool operator<=(const DraftKey &other) const {
+		return !(other < *this);
+	}
+	inline bool operator>=(const DraftKey &other) const {
+		return !(*this < other);
+	}
+	inline bool operator!=(const DraftKey &other) const {
+		return !(*this == other);
+	}
+	inline explicit operator bool() const {
+		return _value != 0;
+	}
+
+private:
+	DraftKey(int value) : _value(value) {
+	}
+
+	static constexpr auto kLocalDraftIndex = -1;
+	static constexpr auto kCloudDraftIndex = -2;
+	static constexpr auto kScheduledDraftIndex = -3;
+	static constexpr auto kEditDraftShift = ServerMaxMsgId;
+
+	int _value = 0;
+
+};
+
+using HistoryDrafts = base::flat_map<DraftKey, std::unique_ptr<Draft>>;
 
 inline bool draftStringIsEmpty(const QString &text) {
 	for_const (auto ch, text) {
@@ -58,11 +134,12 @@ inline bool draftStringIsEmpty(const QString &text) {
 	return true;
 }
 
-inline bool draftIsNull(Draft *draft) {
-	return !draft || (draftStringIsEmpty(draft->textWithTags.text) && !draft->msgId);
+inline bool draftIsNull(const Draft *draft) {
+	return !draft
+		|| (draftStringIsEmpty(draft->textWithTags.text) && !draft->msgId);
 }
 
-inline bool draftsAreEqual(Draft *a, Draft *b) {
+inline bool draftsAreEqual(const Draft *a, const Draft *b) {
 	bool aIsNull = draftIsNull(a);
 	bool bIsNull = draftIsNull(b);
 	if (aIsNull) {
@@ -71,7 +148,9 @@ inline bool draftsAreEqual(Draft *a, Draft *b) {
 		return false;
 	}
 
-	return (a->textWithTags == b->textWithTags) && (a->msgId == b->msgId) && (a->previewCancelled == b->previewCancelled);
+	return (a->textWithTags == b->textWithTags)
+		&& (a->msgId == b->msgId)
+		&& (a->previewState == b->previewState);
 }
 
 } // namespace Data

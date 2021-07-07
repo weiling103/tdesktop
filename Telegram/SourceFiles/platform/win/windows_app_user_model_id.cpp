@@ -1,22 +1,9 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/win/windows_app_user_model_id.h"
 
@@ -25,9 +12,7 @@ Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
 #include <propkey.h>
 
 #include <roapi.h>
-#include <wrl\client.h>
-#include <wrl\implements.h>
-#include <windows.ui.notifications.h>
+#include <wrl/client.h>
 
 using namespace Microsoft::WRL;
 
@@ -43,7 +28,7 @@ const WCHAR AppUserModelIdRelease[] = L"Telegram.TelegramDesktop.Store";
 #else // OS_WIN_STORE
 const WCHAR AppUserModelIdRelease[] = L"Telegram.TelegramDesktop";
 #endif // OS_WIN_STORE
-const WCHAR AppUserModelIdBeta[] = L"Telegram.TelegramDesktop.Beta";
+const WCHAR AppUserModelIdAlpha[] = L"Telegram.TelegramDesktop.Alpha";
 
 } // namespace
 
@@ -265,8 +250,8 @@ bool validateShortcut() {
 	QString path = systemShortcutPath();
 	if (path.isEmpty() || cExeName().isEmpty()) return false;
 
-	if (cBetaVersion()) {
-		path += qsl("TelegramBeta.lnk");
+	if (cAlphaVersion()) {
+		path += qsl("TelegramAlpha.lnk");
 		if (validateShortcutAt(path)) return true;
 	} else {
 		if (validateShortcutAt(path + qsl("Telegram Desktop/Telegram.lnk"))) return true;
@@ -301,6 +286,7 @@ bool validateShortcut() {
 	PropVariantClear(&appIdPropVar);
 	if (!SUCCEEDED(hr)) return false;
 
+#if WINVER >= 0x602
 	PROPVARIANT startPinPropVar;
 	hr = InitPropVariantFromUInt32(APPUSERMODEL_STARTPINOPTION_NOPINONINSTALL, &startPinPropVar);
 	if (!SUCCEEDED(hr)) return false;
@@ -308,6 +294,7 @@ bool validateShortcut() {
 	hr = propertyStore->SetValue(pkey_AppUserModel_StartPinOption, startPinPropVar);
 	PropVariantClear(&startPinPropVar);
 	if (!SUCCEEDED(hr)) return false;
+#endif // WINVER >= 0x602
 
 	hr = propertyStore->Commit();
 	if (!SUCCEEDED(hr)) return false;
@@ -323,7 +310,7 @@ bool validateShortcut() {
 }
 
 const WCHAR *getId() {
-	return cBetaVersion() ? AppUserModelIdBeta : AppUserModelIdRelease;
+	return cAlphaVersion() ? AppUserModelIdAlpha : AppUserModelIdRelease;
 }
 
 const PROPERTYKEY &getKey() {

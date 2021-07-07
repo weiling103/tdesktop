@@ -1,29 +1,19 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/themes/window_theme_editor_block.h"
 
 #include "styles/style_window.h"
 #include "ui/effects/ripple_animation.h"
+#include "ui/widgets/shadow.h"
 #include "boxes/edit_color_box.h"
 #include "lang/lang_keys.h"
+#include "base/call_delayed.h"
+#include "base/qt_adapters.h"
 
 namespace Window {
 namespace Theme {
@@ -55,9 +45,9 @@ public:
 	}
 
 	QString description() const {
-		return _description.originalText();
+		return _description.toString();
 	}
-	const Text &descriptionText() const {
+	const Ui::Text::String &descriptionText() const {
 		return _description;
 	}
 	void setDescription(const QString &description) {
@@ -114,7 +104,7 @@ private:
 	QString _copyOf;
 	QColor _value;
 	QString _valueString;
-	Text _description = { st::windowMinWidth / 2 };
+	Ui::Text::String _description = { st::windowMinWidth / 2 };
 
 	OrderedSet<QString> _searchWords;
 	OrderedSet<QChar> _searchStartChars;
@@ -139,14 +129,14 @@ void EditorBlock::Row::setValue(QColor value) {
 }
 
 void EditorBlock::Row::fillValueString() {
-	auto addHex = [this](int code) {
+	auto addHex = [=](int code) {
 		if (code >= 0 && code < 10) {
 			_valueString.append('0' + code);
 		} else if (code >= 10 && code < 16) {
 			_valueString.append('a' + (code - 10));
 		}
 	};
-	auto addCode = [this, addHex](int code) {
+	auto addCode = [=](int code) {
 		addHex(code / 16);
 		addHex(code % 16);
 	};
@@ -164,8 +154,8 @@ void EditorBlock::Row::fillValueString() {
 void EditorBlock::Row::fillSearchIndex() {
 	_searchWords.clear();
 	_searchStartChars.clear();
-	auto toIndex = _name + ' ' + _copyOf + ' ' + TextUtilities::RemoveAccents(_description.originalText()) + ' ' + _valueString;
-	auto words = toIndex.toLower().split(SearchSplitter, QString::SkipEmptyParts);
+	auto toIndex = _name + ' ' + _copyOf + ' ' + TextUtilities::RemoveAccents(_description.toString()) + ' ' + _valueString;
+	auto words = toIndex.toLower().split(SearchSplitter, base::QStringSkipEmptyParts);
 	for_const (auto &word, words) {
 		_searchWords.insert(word);
 		_searchStartChars.insert(word[0]);
@@ -175,7 +165,7 @@ void EditorBlock::Row::fillSearchIndex() {
 EditorBlock::EditorBlock(QWidget *parent, Type type, Context *context) : TWidget(parent)
 , _type(type)
 , _context(context)
-, _transparent(style::transparentPlaceholderBrush()) {
+, _transparent(style::TransparentPlaceholder()) {
 	setMouseTracking(true);
 	subscribe(_context->updated, [this] {
 		if (_mouseSelection) {
@@ -231,7 +221,7 @@ bool EditorBlock::feedCopy(const QString &name, const QString &copyOf) {
 		}
 		addRow(name, copyOf, row->value());
 	} else {
-		LOG(("Theme Warning: Skipping value '%1: %2' (expected a color value in #rrggbb or #rrggbbaa or a previously defined key in the color scheme)").arg(name).arg(copyOf));
+		LOG(("Theme Warning: Skipping value '%1: %2' (expected a color value in #rrggbb or #rrggbbaa or a previously defined key in the color scheme)").arg(name, copyOf));
 	}
 	return true;
 }
@@ -249,6 +239,7 @@ void EditorBlock::removeRow(const QString &name, bool removeCopyReferences) {
 			row.setCopyOf(QString());
 		}
 	}
+	removeFromSearch(_data[index]);
 	_data.erase(_data.begin() + index);
 	_indices.erase(it);
 	for (auto i = index, count = static_cast<int>(_data.size()); i != count; ++i) {
@@ -305,11 +296,11 @@ void EditorBlock::activateRow(const Row &row) {
 		}
 	} else {
 		_editing = findRowIndex(&row);
-		if (auto box = Ui::show(Box<EditColorBox>(row.name(), row.value()))) {
-			box->setSaveCallback(base::lambda_guarded(this, [this](QColor value) {
+		if (auto box = Ui::show(Box<EditColorBox>(row.name(), EditColorBox::Mode::RGBA, row.value()))) {
+			box->setSaveCallback(crl::guard(this, [this](QColor value) {
 				saveEditing(value);
 			}));
-			box->setCancelCallback(base::lambda_guarded(this, [this] {
+			box->setCancelCallback(crl::guard(this, [this] {
 				cancelEditing();
 			}));
 			_context->box = box;
@@ -322,7 +313,9 @@ void EditorBlock::activateRow(const Row &row) {
 bool EditorBlock::selectSkip(int direction) {
 	_mouseSelection = false;
 
-	auto maxSelected = (isSearch() ? _searchResults.size() : _data.size()) - 1;
+	auto maxSelected = size_type(isSearch()
+		? _searchResults.size()
+		: _data.size()) - 1;
 	auto newSelected = _selected + direction;
 	if (newSelected < -1 || newSelected > maxSelected) {
 		newSelected = maxSelected;
@@ -404,6 +397,29 @@ bool EditorBlock::feedDescription(const QString &name, const QString &descriptio
 	return false;
 }
 
+void EditorBlock::sortByDistance(const QColor &to) {
+	auto toHue = int();
+	auto toSaturation = int();
+	auto toLightness = int();
+	to.getHsl(&toHue, &toSaturation, &toLightness);
+	ranges::sort(_data, ranges::less(), [&](const Row &row) {
+		auto fromHue = int();
+		auto fromSaturation = int();
+		auto fromLightness = int();
+		row.value().getHsl(&fromHue, &fromSaturation, &fromLightness);
+		if (!row.copyOf().isEmpty()) {
+			return 365;
+		}
+		const auto a = std::abs(fromHue - toHue);
+		const auto b = 360 + fromHue - toHue;
+		const auto c = 360 + toHue - fromHue;
+		if (std::min(a, std::min(b, c)) > 15) {
+			return 363;
+		}
+		return 255 - fromSaturation;
+	});
+}
+
 template <typename Callback>
 void EditorBlock::enumerateRows(Callback callback) {
 	if (isSearch()) {
@@ -430,7 +446,7 @@ void EditorBlock::enumerateRows(Callback callback) const {
 			}
 		}
 	} else {
-		for_const (auto &row, _data) {
+		for (const auto &row : _data) {
 			if (!callback(row)) {
 				break;
 			}
@@ -471,7 +487,7 @@ void EditorBlock::enumerateRowsFrom(int top, Callback callback) const {
 int EditorBlock::resizeGetHeight(int newWidth) {
 	auto result = 0;
 	auto descriptionWidth = newWidth - st::themeEditorMargin.left() - st::themeEditorMargin.right();
-	enumerateRows([this, &result, descriptionWidth](Row &row) {
+	enumerateRows([&](Row &row) {
 		row.setTop(result);
 
 		auto height = row.height();
@@ -508,7 +524,7 @@ void EditorBlock::mouseReleaseEvent(QMouseEvent *e) {
 		if (_context->box) {
 			chooseRow();
 		} else if (_selected >= 0) {
-			App::CallDelayed(st::defaultRippleAnimation.hideDuration, this, [this, index = findRowIndex(&rowAtIndex(_selected))] {
+			base::call_delayed(st::defaultRippleAnimation.hideDuration, this, [this, index = findRowIndex(&rowAtIndex(_selected))] {
 				if (index >= 0 && index < _data.size()) {
 					activateRow(_data[index]);
 				}
@@ -630,22 +646,21 @@ void EditorBlock::paintEvent(QPaintEvent *e) {
 		p.fillRect(clip, st::dialogsBg);
 		p.setFont(st::noContactsFont);
 		p.setPen(st::noContactsColor);
-		p.drawText(QRect(0, 0, width(), st::noContactsHeight), lang(lng_theme_editor_no_keys));
+		p.drawText(QRect(0, 0, width(), st::noContactsHeight), tr::lng_theme_editor_no_keys(tr::now));
 	}
 
-	auto ms = getms();
 	auto cliptop = clip.y();
 	auto clipbottom = cliptop + clip.height();
-	enumerateRowsFrom(cliptop, [this, &p, clipbottom, ms](int index, const Row &row) {
+	enumerateRowsFrom(cliptop, [&](int index, const Row &row) {
 		if (row.top() >= clipbottom) {
 			return false;
 		}
-		paintRow(p, index, row, ms);
+		paintRow(p, index, row);
 		return true;
 	});
 }
 
-void EditorBlock::paintRow(Painter &p, int index, const Row &row, TimeMs ms) {
+void EditorBlock::paintRow(Painter &p, int index, const Row &row) {
 	auto rowTop = row.top() + st::themeEditorMargin.top();
 
 	auto rect = QRect(0, row.top(), width(), row.height());
@@ -653,7 +668,7 @@ void EditorBlock::paintRow(Painter &p, int index, const Row &row, TimeMs ms) {
 	auto active = (findRowIndex(&row) == _editing);
 	p.fillRect(rect, active ? st::dialogsBgActive : selected ? st::dialogsBgOver : st::dialogsBg);
 	if (auto ripple = row.ripple()) {
-		ripple->paint(p, 0, row.top(), width(), ms, &(active ? st::activeButtonBgRipple : st::windowBgRipple)->c);
+		ripple->paint(p, 0, row.top(), width(), &(active ? st::activeButtonBgRipple : st::windowBgRipple)->c);
 		if (ripple->empty()) {
 			row.resetRipple();
 		}

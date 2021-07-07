@@ -1,26 +1,12 @@
 /*
 This file is part of Telegram Desktop,
-the official desktop version of Telegram messaging app, see https://telegram.org
+the official desktop application for the Telegram messaging service.
 
-Telegram Desktop is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-It is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-In addition, as a special exception, the copyright holders give permission
-to link the code of portions of this program with the OpenSSL library.
-
-Full license: https://github.com/telegramdesktop/tdesktop/blob/master/LICENSE
-Copyright (c) 2014-2017 John Preston, https://desktop.telegram.org
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "scheme.h"
 #include "base/flags.h"
 
 inline MTPbool MTP_bool(bool v) {
@@ -47,81 +33,109 @@ namespace base {\
 }
 
 // we use the same flags field for some additional client side flags
-enum class MTPDmessage_ClientFlag : int32 {
+enum class MTPDmessage_ClientFlag : uint32 {
 	// message has links for "shared links" indexing
-	f_has_text_links = (1 << 30),
+	f_has_text_links = (1U << 30),
 
-	// message is a group migrate (group -> supergroup) service message
-	f_is_group_migrate = (1 << 29),
+	// message is a group / channel create or migrate service message
+	f_is_group_essential = (1U << 29),
 
-	// message needs initDimensions() + resize() + paint()
-	f_pending_init_dimensions = (1 << 28),
-
-	// message needs resize() + paint()
-	f_pending_resize = (1 << 27),
-
-	// message needs paint()
-	f_pending_paint = (1 << 26),
-
-	// message is attached to previous one when displaying the history
-	f_attach_to_previous = (1 << 25),
-
-	// message is attached to next one when displaying the history
-	f_attach_to_next = (1 << 24),
+	// message's edited media is generated on the client
+	// and should not update media from server
+	f_is_local_update_media = (1U << 28),
 
 	// message was sent from inline bot, need to re-set media when sent
-	f_from_inline_bot = (1 << 23),
+	f_from_inline_bot = (1U << 27),
 
 	// message has a switch inline keyboard button, need to return to inline
-	f_has_switch_inline_button = (1 << 22),
+	f_has_switch_inline_button = (1U << 26),
 
 	// message is generated on the client side and should be unread
-	f_clientside_unread = (1 << 21),
+	f_clientside_unread = (1U << 25),
 
-	// update this when adding new client side flags
-	MIN_FIELD = (1 << 21),
+	// message has an admin badge in supergroup
+	f_has_admin_badge = (1U << 24),
+
+	// message is an outgoing message that is being sent
+	f_sending = (1U << 23),
+
+	// message was an outgoing message and failed to be sent
+	f_failed = (1U << 22),
+
+	// message has no media and only a several emoji text
+	f_isolated_emoji = (1U << 21),
+
+	// message is local message existing in the message history
+	f_local_history_entry = (1U << 20),
+
+	// message is an admin log entry
+	f_admin_log_entry = (1U << 19),
+
+	// message is a fake message for some ui
+	f_fake_history_item = (1U << 18),
 };
-DEFINE_MTP_CLIENT_FLAGS(MTPDmessage)
+inline constexpr bool is_flag_type(MTPDmessage_ClientFlag) { return true; }
+using MTPDmessage_ClientFlags = base::flags<MTPDmessage_ClientFlag>;
 
-enum class MTPDreplyKeyboardMarkup_ClientFlag : int32 {
+enum class MTPDreplyKeyboardMarkup_ClientFlag : uint32 {
 	// none (zero) markup
-	f_zero = (1 << 30),
+	f_zero = (1U << 30),
 
 	// markup just wants a text reply
-	f_force_reply = (1 << 29),
+	f_force_reply = (1U << 29),
 
 	// markup keyboard is inline
-	f_inline = (1 << 28),
+	f_inline = (1U << 28),
 
 	// markup has a switch inline keyboard button
-	f_has_switch_inline_button = (1 << 27),
+	f_has_switch_inline_button = (1U << 27),
 
 	// update this when adding new client side flags
-	MIN_FIELD = (1 << 27),
+	MIN_FIELD = (1U << 27),
 };
 DEFINE_MTP_CLIENT_FLAGS(MTPDreplyKeyboardMarkup)
 
-enum class MTPDstickerSet_ClientFlag : int32 {
-	// old value for sticker set is not yet loaded flag
-	f_not_loaded__old = (1 << 31),
-
+enum class MTPDstickerSet_ClientFlag : uint32 {
 	// sticker set is not yet loaded
-	f_not_loaded = (1 << 30),
+	f_not_loaded = (1U << 30),
 
 	// sticker set is one of featured (should be saved locally)
-	f_featured = (1 << 29),
+	f_featured = (1U << 29),
 
 	// sticker set is an unread featured set
-	f_unread = (1 << 28),
+	f_unread = (1U << 28),
 
 	// special set like recent or custom stickers
-	f_special = (1 << 27),
+	f_special = (1U << 27),
 
 	// update this when adding new client side flags
-	MIN_FIELD = (1 << 27),
+	MIN_FIELD = (1U << 27),
 };
 DEFINE_MTP_CLIENT_FLAGS(MTPDstickerSet)
 
-extern const MTPReplyMarkup MTPnullMarkup;
-extern const MTPVector<MTPMessageEntity> MTPnullEntities;
-extern const MTPMessageFwdHeader MTPnullFwdHeader;
+//enum class MTPDuser_ClientFlag : uint32 {
+//	// forbidden constructor received
+//	f_inaccessible = (1U << 31),
+//
+//	// update this when adding new client side flags
+//	MIN_FIELD = (1U << 31),
+//};
+//DEFINE_MTP_CLIENT_FLAGS(MTPDuser)
+
+enum class MTPDchat_ClientFlag : uint32 {
+	// forbidden constructor received
+	f_forbidden = (1U << 31),
+
+	// update this when adding new client side flags
+	MIN_FIELD = (1U << 31),
+};
+DEFINE_MTP_CLIENT_FLAGS(MTPDchat)
+
+enum class MTPDchannel_ClientFlag : uint32 {
+	// forbidden constructor received
+	f_forbidden = (1U << 31),
+
+	// update this when adding new client side flags
+	MIN_FIELD = (1U << 31),
+};
+DEFINE_MTP_CLIENT_FLAGS(MTPDchannel)
